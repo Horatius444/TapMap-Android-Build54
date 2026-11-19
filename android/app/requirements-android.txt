@@ -4,3 +4,4 @@ pycountry==26.2.16
 maxminddb==3.1.1
 requests==2.34.2
 certifi==2026.7.22
+paho-mqtt==2.1.0
