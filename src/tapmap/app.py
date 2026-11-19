@@ -1,0 +1,2365 @@
+"""Dash application entry point for TapMap.
+
+This module wires together the main application layers:
+
+- model: runtime state and data collection (snapshot, GeoIP reload, caches)
+- geodb: GeoIP database installation, updates, validation, and status
+- state: pure decision logic (no Dash code)
+- ui: rendering helpers (map, modal, status text)
+
+app.py contains Dash callback wiring and controller code only.
+Deterministic state transitions live in the state package.
+
+Dash callbacks return multiple values because each Output property
+requires one return value. For example, modal_controller returns:
+
+    modal_state
+    modal_overlay className
+    modal_body children
+    modal_body className
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import copy
+import json
+import logging
+import os
+import platform
+import sys
+import threading
+import time
+import webbrowser
+from dataclasses import replace
+from datetime import datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, TypedDict
+
+import dash
+from dash import ALL, Dash, Input, Output, State, ctx, dcc, html, no_update
+from dash.exceptions import PreventUpdate
+from werkzeug.serving import make_server
+
+from tapmap import __version__
+from tapmap.geodb import GeoDbService
+from tapmap.geodb.service import GeoDbResponse
+from tapmap.history_backup import backup_corrupt_file
+from tapmap.insights_persistence import (
+    build_daily_report as persist_build_daily_report,
+)
+from tapmap.insights_persistence import (
+    load_insights,
+    save_insights,
+)
+from tapmap.model.appinfo import AppInfo
+from tapmap.model.geoinfo import GeoInfo
+from tapmap.model.model import Model
+from tapmap.model.netinfo import NetInfo
+from tapmap.model.public_ip import iter_public_ip_candidates
+from tapmap.settings_persistence import Settings, load_settings, save_settings
+from tapmap.significant_connections_persistence import (
+    load_significant_connections,
+    save_significant_connections,
+)
+from tapmap.state.connection_analyzer import ConnectionAnalyzer
+from tapmap.state.connection_state import ConnectionState
+from tapmap.state.insights import entry_history
+from tapmap.state.insights_log import write_insights_log
+from tapmap.state.insights_state import CURRENT_SCHEMA_VERSION, InsightsState
+from tapmap.state.keyboard import build_key_action
+from tapmap.state.menu import compute_menu_open_state
+from tapmap.state.modal import decide_modal_route
+from tapmap.state.notification_policy import event_day_ordinals, record_learning_completion
+from tapmap.state.open_ports_prefs import set_show_system_pref
+from tapmap.state.poll import (
+    ACTION_CLEAR_CACHE,
+    ACTION_NORMAL_POLL,
+    ACTION_REBUILD_VIEW,
+    ACTION_ZOOM_CONNECTIONS,
+    PollDecision,
+    decide_poll_action,
+)
+from tapmap.state.significance import SignificanceHistory
+from tapmap.state.significant_connections import SignificantConnections
+from tapmap.state.status_cache import StatusCache
+from tapmap.state.status_line import render_status_text
+from tapmap.state.unmapped_state import UnmappedState
+from tapmap.ui.daily_activity_report_view import render_daily_activity_report
+from tapmap.ui.insights_log_view import render_insights_log
+from tapmap.ui.insights_view import render_insights_entry_detail, render_insights_panel
+from tapmap.ui.layout_view import render_layout
+from tapmap.ui.map_view import MapUI
+from tapmap.ui.modal_view import ModalTextBuilder
+from tapmap.ui.service_point_view import ServicePointViewBuilder
+from tapmap.ui.significant_connections_view import (
+    render_significant_connection_detail,
+    render_significant_connections,
+)
+
+from .app_dirs import open_folder, reveal_in_file_manager
+from .config import COORD_PRECISION, MY_LOCATION, POLL_INTERVAL_MS, ZOOM_NEAR_KM
+from .lifecycle import LifecycleCoordinator, start_poller_thread, start_server_thread
+from .logging_config import configure_logging
+from .mqtt_cli import run_configure_mqtt
+from .mqtt_config import load_mqtt_config, mqtt_config_path
+from .notifications.channel import NotificationChannel, dispatch_notification
+from .notifications.desktop import create_desktop_notification_channel
+from .notifications.mqtt import create_mqtt_channel
+from .runtime import AppMeta, RuntimeContext, build_runtime
+from .tray import create_tray_icon
+
+if TYPE_CHECKING:
+    from .tray import TrayIcon
+
+LonLat = tuple[float, float]
+
+APP_META: Final[AppMeta] = AppMeta(
+    name="TapMap",
+    version=__version__,
+    author="Ola Lie",
+)
+
+# Together below Docker's default 10 s stop grace period.
+POLLER_JOIN_TIMEOUT_S: Final[float] = 8.0
+SHUTDOWN_LOCK_TIMEOUT_S: Final[float] = 0.5
+
+class GeoDbEvent(TypedDict):
+    """GeoDB action and response payload for UI rendering."""
+
+    action: Literal[
+        "install_maxmind",
+        "install_dbip",
+        "update",
+        "recheck",
+    ]
+    response: GeoDbResponse
+    
+    
+class TapMap:
+    """Coordinate Dash callbacks, model polling, and UI state."""
+
+    SCR_GEODB_MANAGEMENT = "menu_geodb_management"
+
+    MENU_SCREENS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "menu_unmapped",
+            "menu_lan_local",
+            "menu_open_ports",
+            SCR_GEODB_MANAGEMENT,
+            "menu_help",
+            "menu_about",
+            "menu_daily_report",
+            "menu_insights_log",
+            "menu_significant_connections",
+            "menu_significant_connection_detail",
+            "menu_exit",
+        }
+    )
+    MENU_COMMANDS: ClassVar[frozenset[str]] = frozenset(
+        {"menu_clear_cache", "menu_export_cache"}
+    )
+
+    MIN_FLASH_S = 3.0
+
+    def __init__(self, runtime_ctx: RuntimeContext) -> None:
+        """Build runtime state, wire Dash callbacks, and start from persisted history."""
+        self.runtime = runtime_ctx
+        self.logger = logging.getLogger(__name__)
+        self.lifecycle = LifecycleCoordinator()
+        # _model_lock: Model observation, GeoInfo readers, and Model resource shutdown.
+        # _state_lock: analysis state, history, status cache, published poll result.
+        # _history_save_lock: one history save at a time, in order.
+        # Only nesting: _history_save_lock, then _state_lock.
+        self._model_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._history_save_lock = threading.Lock()
+        self._lock_path = self.runtime.app_data_dir / "tapmap.lock"
+        self._acquire_lock()
+        self._run_autostart_startup_setup()
+
+        self.app = Dash(
+            __name__,
+            title=self.runtime.meta.name,
+            update_title=None,
+            suppress_callback_exceptions=True,
+        )
+
+        self.ui = MapUI(zoom_near_km=ZOOM_NEAR_KM)
+        self.view_builder = ServicePointViewBuilder(
+            coord_precision=COORD_PRECISION,
+            is_docker=self.runtime.is_docker,
+        )
+        self.connection_state = ConnectionState(
+            cache_retention_min=self.runtime.cache_retention_min
+        )
+        self.unmapped_state = UnmappedState(
+            cache_retention_min=self.runtime.cache_retention_min
+        )
+        self._status_cache = StatusCache()
+        # Technical details setting the current ui_view was built with, so a
+        # setting change can trigger an immediate rebuild instead of waiting for
+        # the next poll.
+        self._last_built_technical_details: bool | None = None
+
+        self.modal_text = ModalTextBuilder(
+            self.runtime.meta.name,
+            self.runtime.meta.version,
+            self.runtime.meta.author,
+        )
+        self.geodb = GeoDbService(self.runtime)
+
+        self.model = Model(
+            netinfo=NetInfo(),
+            geoinfo=GeoInfo(data_dir=self.runtime.geo_data_dir),
+            appinfo=AppInfo(security_extensions_dir=self.runtime.security_extensions_dir),
+        )
+
+        self._public_ip_cached: str | None = None
+        self._auto_geo_cached: dict[str, Any] = {}
+
+        self.my_location = self._resolve_my_location()
+
+        self.graph_config = {
+            "displaylogo": False,
+            "scrollZoom": False,
+            "modeBarButtonsToRemove": [
+                "toImage",
+                "select2d",
+                "lasso2d",
+                "hoverClosestGeo",
+                "toggleHover",
+            ],
+        }
+
+        self.insights_path = self.runtime.app_data_dir / "insights.json"
+        self.significant_connections_path = (
+            self.runtime.app_data_dir / "significant_connections.json"
+        )
+        self._load_history()
+        self._record_learning_completion_from_history()
+        self._last_history_save_s: float | None = None
+        self._latest_snapshot: dict[str, Any] | None = None
+        self._latest_insights: dict[str, Any] | None = None
+        self._poller_thread: threading.Thread | None = None
+
+        # Constructed after _load_history() so SignificanceHistory derives from
+        # the loaded InsightsState, and ConnectionAnalyzer references the
+        # already-loaded SignificantConnections.
+        self.significance_history = SignificanceHistory.from_insights_state(self.insights_state)
+
+        self.settings_path = self.runtime.app_data_dir / "settings.json"
+        self.settings: Settings = load_settings(self.settings_path)
+
+        self.mqtt_channel = create_mqtt_channel(self.runtime)
+        self.desktop_notification_channel = (
+            None
+            if self.runtime.is_docker or os.environ.get("TAPMAP_ANDROID") == "1"
+            else create_desktop_notification_channel(
+                icon_path=self.runtime.tray_icon_path,
+                enabled=self.settings.desktop_notifications,
+            )
+        )
+        self.notification_channels: list[NotificationChannel] = [
+            channel
+            for channel in (self.mqtt_channel, self.desktop_notification_channel)
+            if channel is not None
+        ]
+        self.connection_analyzer = ConnectionAnalyzer(
+            self.connection_state,
+            self.unmapped_state,
+            self.insights_state,
+            self.significant_connections,
+            self.significance_history,
+            notification_learning_days=self.runtime.notification_learning_days,
+        )
+
+        start_fig = self.ui.create_figure(([], self.my_location))
+        self.app.layout = self._build_layout(start_fig)
+        self._register_callbacks()
+        self._poll_count = 0
+        self._modal_count = 0
+        self._geodb_controller_count = 0
+
+    @staticmethod
+    def _menu_panel_class(is_open: bool) -> str:
+        return "mx-panel is-open" if is_open else "mx-panel"
+
+    @staticmethod
+    def _menu_overlay_class(is_open: bool) -> str:
+        return "mx-overlay is-open" if is_open else "mx-overlay"
+
+    @staticmethod
+    def _modal_overlay_class(is_open: bool) -> str:
+        return "modal-overlay is-open" if is_open else "modal-overlay"
+
+    def _build_layout(self, start_fig: Any) -> html.Div:
+        geo_status = self.geodb.local_status()
+        geo_ready = geo_status["provider"] != "none"
+        initial_modal_state: dict[str, Any] | None = None
+        if not geo_ready:
+            initial_modal_state = {
+                "screen": self.SCR_GEODB_MANAGEMENT,
+                "t": datetime.now().isoformat(),
+                "payload": {"startup_required": True},
+            }
+
+        initial_modal_open = bool(initial_modal_state)
+
+        initial_body_children: list[Any] = []
+        initial_body_class = "modal-body"
+        autostart_supported = self._autostart_supported()
+        initial_autostart_display_state = "off"
+        initial_autostart_disabled = True
+        if autostart_supported:
+            from tapmap.state.autostart import ClickAction
+
+            initial_decision = self._current_autostart_decision()
+            initial_autostart_display_state = initial_decision.display_state.value
+            initial_autostart_disabled = initial_decision.click_action == ClickAction.NONE
+
+        if initial_modal_state is not None:
+            geo_path = str(self.runtime.geo_data_dir)
+            initial_body_children = self._as_children(
+                self.modal_text.geodb_management(
+                    status=geo_status,
+                    geo_data_dir=geo_path,
+                    is_docker=self.runtime.is_docker,
+                )
+            )
+            initial_body_class = self._class_for_modal_screen(self.SCR_GEODB_MANAGEMENT)
+
+        return render_layout(
+            app_name=self.runtime.meta.name,
+            start_fig=start_fig,
+            graph_config=self.graph_config,
+            poll_interval_ms=POLL_INTERVAL_MS,
+            status_cache_store=StatusCache().to_store(),
+            initial_modal_state=initial_modal_state,
+            initial_modal_open=initial_modal_open,
+            initial_body_children=initial_body_children,
+            initial_body_class=initial_body_class,
+            menu_overlay_class=self._menu_overlay_class(False),
+            menu_panel_class=self._menu_panel_class(False),
+            modal_overlay_class=self._modal_overlay_class(initial_modal_open),
+            initial_insights_on=self.settings.insights_panel,
+            initial_technical_details_on=self.settings.technical_details,
+            initial_notifications_on=self.settings.desktop_notifications,
+            autostart_supported=autostart_supported,
+            initial_autostart_display_state=initial_autostart_display_state,
+            initial_autostart_disabled=initial_autostart_disabled,
+        )
+
+    @staticmethod
+    def _ensure_dict(value: object) -> dict[str, Any]:
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _ensure_list(value: object) -> list[Any]:
+        return value if isinstance(value, list) else []
+
+    @staticmethod
+    def _to_int(value: object, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _flash(message: str, seconds: float) -> dict[str, Any]:
+        return {"message": message, "until": (datetime.now().timestamp() + float(seconds))}
+
+    def _myloc_label(self) -> str:
+        if self.runtime.location_override is not None:
+            return "ENV"
+        if isinstance(MY_LOCATION, tuple):
+            return "FIXED"
+        if MY_LOCATION == "none":
+            return "OFF"
+        if MY_LOCATION == "auto":
+            return "AUTO" if self.my_location else "AUTO (NO GEO)"
+        return "OFF"
+
+    def _resolve_my_location(self) -> list[LonLat]:
+        if self.runtime.location_override is not None:
+            return [self.runtime.location_override]
+
+        if isinstance(MY_LOCATION, tuple):
+            return [MY_LOCATION]
+
+        if MY_LOCATION == "none":
+            return []
+
+        if MY_LOCATION == "auto":
+            if not getattr(self.model.geoinfo, "city_enabled", False):
+                self._public_ip_cached = None
+                self._auto_geo_cached = {}
+                return []
+
+            for ip in iter_public_ip_candidates(timeout_s=2.0):
+                with self._model_lock:
+                    geo = self.model.geoinfo.lookup(ip)
+                geo_dict = geo if isinstance(geo, dict) else {}
+                lat = geo_dict.get("lat")
+                lon = geo_dict.get("lon")
+
+                if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
+                    self._public_ip_cached = ip
+                    self._auto_geo_cached = dict(geo_dict)
+                    return [(float(lon), float(lat))]
+
+            self._public_ip_cached = None
+            self._auto_geo_cached = {}
+            return []
+
+        return []
+
+    def _build_runtime_info(self) -> dict[str, Any]:
+        geo_status = self.geodb.local_status()
+        mqtt_config = load_mqtt_config(mqtt_config_path(self.runtime.app_data_dir))
+        return {
+            "poll_interval_ms": POLL_INTERVAL_MS,
+            "coord_precision": COORD_PRECISION,
+            "zoom_near_km": ZOOM_NEAR_KM,
+            "geoinfo_enabled": bool(getattr(self.model.geoinfo, "city_enabled", False)),
+            "geo_data_dir": str(self.runtime.geo_data_dir),
+            "app_data_dir": str(self.runtime.app_data_dir),
+            "run_dir": str(self.runtime.run_dir),
+            "is_frozen": bool(self.runtime.is_frozen),
+            "myloc_mode": self._myloc_label(),
+            "my_location": (
+                self.runtime.location_override
+                if self.runtime.location_override is not None
+                else MY_LOCATION
+            ),
+            "public_ip_cached": self._public_ip_cached,
+            "auto_geo_cached": self._auto_geo_cached,
+            "os": f"{platform.system()} {platform.release()}",
+            "python": sys.version.split()[0],
+            "net_backend": self.runtime.net_backend,
+            "net_backend_version": self.runtime.net_backend_version,
+            "server_host": self.runtime.server_host,
+            "server_port": self.runtime.server_port,
+            "launch_browser": self.runtime.launch_browser,
+            "cache_retention_min": self.runtime.cache_retention_min,
+            "is_docker": self.runtime.is_docker,
+            "geo_provider": geo_status["provider"],
+            "geo_database_date": geo_status["local_display_date"],
+            "notification_learning_days": self.runtime.notification_learning_days,
+            "desktop_notifications_available": self.desktop_notification_channel is not None,
+            "mqtt_configured": mqtt_config is not None,
+            "mqtt_host": mqtt_config.host if mqtt_config else None,
+            "mqtt_port": mqtt_config.port if mqtt_config else None,
+            "mqtt_topic": mqtt_config.topic if mqtt_config else None,
+            "mqtt_tls": mqtt_config.tls if mqtt_config else None,
+            "dash_version": getattr(dash, "__version__", "-"),
+        }
+
+    def _reload_geodb_runtime(self) -> bool:
+        """Reload GeoDB readers and refresh runtime state."""
+        geo_status = self.geodb.recheck()
+        with self._model_lock:
+            ok = self.model.geoinfo.reload()
+            is_geoinfo_enabled = self.model.geoinfo.enabled
+        geo_ready = (
+            geo_status["provider"] != "none"
+            and is_geoinfo_enabled
+        )
+
+        if not ok or not geo_ready:
+            return False
+
+        self.my_location = self._resolve_my_location()
+        return True
+
+    def _reload_after_geodb_operation(
+        self,
+        response: GeoDbResponse,
+    ) -> GeoDbResponse:
+        """Reload runtime readers after successful GeoDB operations."""
+        # New MMDB files are not used until runtime readers are reloaded.
+        if (
+            response.get("error") is None
+            and not self._reload_geodb_runtime()
+        ):
+            response["error"] = "reload_failed"
+            response["message"] = (
+                f'{response.get("message", "")} '
+                "Runtime reload failed."
+            ).strip()
+
+        return response
+    
+    def _handle_geo_install_dbip(self) -> GeoDbResponse:
+        return self._reload_after_geodb_operation(
+            self.geodb.install("dbip")
+        )
+
+    def _resolve_maxmind_install_credentials(
+        self,
+        account_id: Any,
+        license_key: Any,
+    ) -> tuple[str, str]:
+        """Resolve MaxMind credentials using UI values first, then stored values."""
+        ui_account_id = account_id.strip() if isinstance(account_id, str) else ""
+        ui_license_key = license_key.strip() if isinstance(license_key, str) else ""
+
+        stored_account_id, stored_license_key = self.geodb.maxmind.stored_credentials()
+        resolved_account_id = ui_account_id or (stored_account_id or "")
+        resolved_license_key = ui_license_key or (stored_license_key or "")
+        return resolved_account_id, resolved_license_key
+
+    def _handle_geo_install_maxmind(
+        self,
+        account_id: Any,
+        license_key: Any,
+    ) -> GeoDbResponse:
+        account_id_text, license_key_text = self._resolve_maxmind_install_credentials(
+            account_id,
+            license_key,
+        )
+
+        try:
+            self.geodb.maxmind.validate_credentials(
+                account_id_text,
+                license_key_text,
+            )
+
+        except ValueError as exc:
+            status = self.geodb.local_status()
+            status["message"] = str(exc)
+            status["error"] = "credentials_invalid"
+            return status
+
+        try:
+            self.geodb.maxmind.register_credentials(
+                account_id_text,
+                license_key_text,
+            )
+
+        except Exception:
+            self.logger.exception("Unable to store MaxMind credentials")
+            status = self.geodb.local_status()
+            status["message"] = "Unable to store MaxMind credentials"
+            status["error"] = "credential_store_failed"
+            return status
+
+        return self._reload_after_geodb_operation(
+            self.geodb.install("maxmind")
+        )
+    
+    def _handle_geo_update(self) -> GeoDbResponse:
+        return self._reload_after_geodb_operation(
+            self.geodb.update()
+        )
+    
+    def _handle_geo_recheck(self) -> GeoDbResponse:
+        return self._reload_after_geodb_operation(
+            self.geodb.recheck()
+        )
+   
+    def _handle_clear_cache(
+        self, status_cache: StatusCache, technical_details_enabled: bool
+    ) -> tuple[Any, Any, Any, Any, Any]:
+        """Reset connection and unmapped state without observing the monitored system."""
+        status_cache.clear()
+        cache = self.connection_state.clear()
+        self.unmapped_state.clear()
+        view = self.view_builder.build_view_from_cache(cache, technical_details_enabled)
+        flash = self._flash("Clearing cache...", self.MIN_FLASH_S)
+        return no_update, status_cache.to_store(), view, flash, no_update
+
+    def poll_once(self) -> None:
+        """Observe connections once, update shared state, and publish the completed poll.
+
+        Take the snapshot under _model_lock and apply it under _state_lock.
+        Dispatch notifications and save history after releasing both locks,
+        unless the snapshot failed.
+        """
+        with self._model_lock:
+            snap = self.model.snapshot()
+
+        with self._state_lock:
+            notifiable_events = self._apply_snapshot(snap)
+
+        if notifiable_events is None:
+            return
+        for event in notifiable_events:
+            dispatch_notification(event, self.notification_channels)
+        self._maybe_save_history()
+
+    def _apply_snapshot(self, snap: Any) -> list[dict[str, Any]] | None:
+        """Update shared state from snap and publish it as the latest completed poll.
+
+        Caller holds _state_lock. Return copies of the Significant Connection
+        events to notify, taken before verification backfill updates the stored
+        events. Return None if snap is a failed snapshot; shared state is then unchanged.
+        """
+        if not isinstance(snap, dict):
+            self._latest_snapshot = {"error": True}
+            self._latest_insights = None
+            return None
+
+        if snap.get("error"):
+            self._latest_snapshot = snap
+            self._latest_insights = None
+            return None
+
+        items_any = snap.get("connections")
+        items = items_any if isinstance(items_any, list) else []
+
+        insights_data, notifiable_events = self.connection_analyzer.analyze(items)
+        notifiable_copies = [dict(event) for event in notifiable_events]
+        self._refresh_pending_app_verifications()
+        self._status_cache.update(items)
+
+        self._latest_snapshot = snap
+        self._latest_insights = insights_data
+        return notifiable_copies
+
+    def _render_latest_poll(
+        self, technical_details_enabled: bool
+    ) -> tuple[Any, Any, Any, Any] | None:
+        """Return the snapshot, status store, view, and Insights result of the latest poll.
+
+        Caller holds _state_lock. Return None if no poll has completed yet.
+        Return no_update for the Insights result if the latest poll failed.
+        """
+        if self._latest_snapshot is None:
+            return None
+
+        snapshot = {**self._latest_snapshot, "runtime_info": self._build_runtime_info()}
+        view = self.view_builder.build_view_from_cache(
+            self.connection_state.cache, technical_details_enabled
+        )
+        insights_data = self._latest_insights if self._latest_insights is not None else no_update
+        return snapshot, self._status_cache.to_store(), view, insights_data
+
+    def _refresh_pending_app_verifications(self) -> None:
+        """Backfill completed AppInfo verification results without starting new AppInfo work."""
+        pending = (
+            self.connection_state.pending_exe_paths()
+            | self.unmapped_state.pending_exe_paths()
+            | self.significant_connections.pending_exe_paths()
+        )
+        if not pending:
+            return
+
+        resolved = self.model.appinfo.resolved_for(pending)
+        if not resolved:
+            return
+
+        fields = {
+            exe: {
+                "app_creator": metadata.creator,
+                "app_verification_status": (
+                    metadata.verification_status.value
+                    if metadata.verification_status is not None
+                    else None
+                ),
+                "app_signature_state": metadata.signature_state,
+                "app_signature_state_details": metadata.signature_state_details,
+            }
+            for exe, metadata in resolved.items()
+        }
+        self.connection_state.refresh_resolved_applications(fields)
+        self.unmapped_state.refresh_resolved_applications(fields)
+        self.significant_connections.refresh_resolved_applications(fields)
+
+    def _server_url(self) -> str:
+        """Return this instance's local web UI URL."""
+        return f"http://{self.runtime.server_host}:{self.runtime.server_port}/"
+
+    def _open_browser(self, url: str, delay_s: float = 0.8) -> None:
+        try:
+            delay = float(delay_s)
+        except (TypeError, ValueError):
+            delay = 0.8
+
+        def _worker() -> None:
+            try:
+                webbrowser.open(url, new=2)
+            except Exception:
+                return
+
+        timer = threading.Timer(delay, _worker)
+        timer.daemon = True
+        timer.start()
+
+    @staticmethod
+    def _open_browser_immediately(url: str) -> None:
+        """Open url in the default browser synchronously, without the startup delay."""
+        with contextlib.suppress(Exception):
+            webbrowser.open(url, new=2)
+
+    @staticmethod
+    def _as_children(value: Any) -> list[Any]:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
+
+    def _class_for_modal_screen(self, screen: str | None) -> str:
+        if screen in {
+            "menu_unmapped",
+            "menu_lan_local",
+            "menu_open_ports",
+            self.SCR_GEODB_MANAGEMENT,
+            "menu_help",
+            "menu_about",
+            "menu_significant_connections",
+        }:
+            return "modal-body mx-sticky-title"
+        return "modal-body"
+
+    @staticmethod
+    def _toggle_on(value: Any) -> bool:
+        return isinstance(value, list) and "on" in value
+
+    @staticmethod
+    def _is_map_reset(relayout_data: Any) -> bool:
+        """Return whether relayout_data matches the map's Reset event."""
+        # Reset includes geo.fitbounds; pan and zoom omit it while the figure leaves it unset.
+        return isinstance(relayout_data, dict) and "geo.fitbounds" in relayout_data
+
+    @staticmethod
+    def _startup_geodb_modal_should_close(
+        modal_state: dict[str, Any] | None,
+        snapshot: Any,
+    ) -> bool:
+        """Return True when the startup GeoDB modal should close after a successful install."""
+        if not isinstance(modal_state, dict):
+            return False
+
+        payload = modal_state.get("payload")
+        payload_data = payload if isinstance(payload, dict) else {}
+        if not bool(payload_data.get("startup_required", False)):
+            return False
+
+        snapshot_data = snapshot if isinstance(snapshot, dict) else {}
+        snapshot_runtime_info = snapshot_data.get("runtime_info")
+        runtime_info = snapshot_runtime_info if isinstance(snapshot_runtime_info, dict) else {}
+        return bool(runtime_info.get("geoinfo_enabled", False))
+
+    def _render_modal(
+        self,
+        modal_state: dict[str, Any] | None,
+        snapshot: Any,
+        ui_view: Any,
+        geo_path: str,
+        geodb_event: dict[str, Any] | None,
+        technical_details_enabled: bool,
+        notifications_enabled: bool,
+    ) -> tuple[list[Any], str]:
+        """Return modal body children and CSS class for the current modal screen."""
+        if not isinstance(modal_state, dict):
+            return [], "modal-body"
+
+        screen = modal_state.get("screen")
+        payload = self._ensure_dict(modal_state.get("payload"))
+        modal_opened_at = modal_state.get("t")
+
+        if not isinstance(screen, str) or not screen:
+            return [], "modal-body"
+
+        if screen == self.SCR_GEODB_MANAGEMENT:
+            children = self._as_children(
+                self.modal_text.geodb_management(
+                    status=self.geodb.local_status(),
+                    geo_data_dir=geo_path,
+                    is_docker=self.runtime.is_docker,
+                    geodb_event=geodb_event,
+                    modal_opened_at=modal_opened_at,
+                )
+            )
+            return children, self._class_for_modal_screen(screen)
+
+        if screen == "map_click":
+            click_data = payload.get("click_data")
+            body = self.modal_text.for_click(click_data, ui_view, is_docker=self.runtime.is_docker)
+            if body is None:
+                return [], "modal-body"
+            return self._as_children(body), "modal-body"
+
+        if screen == "menu_daily_report":
+            report = persist_build_daily_report(self.insights_state.insights)
+            return (
+                render_daily_activity_report(report),
+                self._class_for_modal_screen(screen),
+            )
+
+        if screen == "menu_significant_connections":
+            return (
+                render_significant_connections(self.significant_connections.items),
+                self._class_for_modal_screen(screen),
+            )
+
+        if screen == "menu_significant_connection_detail":
+            event = self.significant_connections.find_by_identity(
+                timestamp=payload.get("timestamp"),
+                pid=payload.get("pid"),
+                ip=payload.get("ip"),
+                port=payload.get("port"),
+                proto=payload.get("proto"),
+            )
+            if event is None:
+                return (
+                    [
+                        html.H1("Significant Connection", className="mx-h1"),
+                        html.Pre("(this Significant Connection is no longer available)"),
+                    ],
+                    self._class_for_modal_screen(screen),
+                )
+            return (
+                render_significant_connection_detail(event),
+                self._class_for_modal_screen(screen),
+            )
+
+        if screen == "menu_insights_entry":
+            category = payload.get("category")
+            value = payload.get("value")
+            if not isinstance(category, str) or not isinstance(value, str):
+                return [], "modal-body"
+
+            today_day = datetime.now().date().toordinal()
+            dimension = self.insights_state.insights.get(category)
+            entry = dimension.get(value) if isinstance(dimension, dict) else None
+            return (
+                render_insights_entry_detail(
+                    category,
+                    value,
+                    entry_history(entry, today_day),
+                    today_day,
+                ),
+                self._class_for_modal_screen(screen),
+            )
+
+        if screen == "menu_insights_log":
+            log_path = self.insights_path.with_suffix(".log")
+            text = ""
+            with contextlib.suppress(Exception):
+                write_insights_log(self.insights_state.insights, log_path)
+                text = log_path.read_text(encoding="utf-8")
+            return (
+                render_insights_log(text),
+                self._class_for_modal_screen(screen),
+            )
+
+        if screen == "menu_exit":
+            return (
+                [
+                    html.H1("TapMap has stopped"),
+                    html.Div(
+                        id="shutdown_screen",
+                        children=[
+                            html.P("Network monitoring has ended."),
+                            html.P("You may now close this browser tab."),
+                            html.P("Start TapMap to begin monitoring again."),
+                        ],
+                    ),
+                ],
+                "modal-body no-close",
+            )
+
+        if screen in self.MENU_SCREENS:
+            show_system = bool(payload.get("show_system", False))
+            body = self.modal_text.for_action(
+                screen,
+                snapshot=snapshot,
+                show_system=show_system,
+                is_docker=self.runtime.is_docker,
+                unmapped_cache=self.unmapped_state.cache,
+                technical_details_enabled=technical_details_enabled,
+                notifications_enabled=notifications_enabled,
+            )
+            return self._as_children(body), self._class_for_modal_screen(screen)
+
+        return [], "modal-body"
+
+    def _render_geodb_status(
+        self,
+        geodb_event_data: dict[str, Any] | None,
+        modal_state_data: dict[str, Any] | None,
+    ) -> list[Any] | None:
+        """Return GeoDB content, or None when its management screen is not open."""
+        if not isinstance(modal_state_data, dict):
+            return None
+
+        if modal_state_data.get("screen") != self.SCR_GEODB_MANAGEMENT:
+            return None
+
+        return self._as_children(
+            self.modal_text.geodb_management(
+                status=self.geodb.local_status(),
+                geo_data_dir=str(self.runtime.geo_data_dir),
+                is_docker=self.runtime.is_docker,
+                geodb_event=geodb_event_data,
+                modal_opened_at=modal_state_data.get("t"),
+            )
+        )
+
+    def _register_callbacks(self) -> None:
+        self._register_keyboard_callbacks()
+        self._register_poll_callbacks()
+        self._register_menu_callbacks()
+        self._register_modal_callbacks()
+        self._register_geodb_callbacks()
+        self._register_modal_render_callbacks()
+        self._register_map_callbacks()
+        self._register_status_callbacks()
+        self._register_insights_callbacks()
+        self._register_os_callbacks()
+        self._register_notifications_callbacks()
+        if self._autostart_supported():
+            self._register_autostart_callbacks()
+
+    def _register_keyboard_callbacks(self) -> None:
+        @self.app.callback(
+            Output("key_action", "data"),
+            Output("key_capture", "value"),
+            Input("key_capture", "value"),
+            prevent_initial_call=True,
+        )
+        def on_key(value: str) -> tuple[Any, str]:
+            action = build_key_action(value)
+            if action is None:
+                return no_update, ""
+            return action, ""
+
+    def _register_poll_callbacks(self) -> None:
+        @self.app.callback(
+            Output("model_snapshot", "data"),
+            Output("status_cache", "data"),
+            Output("ui_view", "data"),
+            Output("status_flash", "data"),
+            Output("insights_cache", "data"),
+            Input("tick_model", "n_intervals"),
+            Input("key_action", "data"),
+            Input("menu_clear_cache", "n_clicks"),
+            Input("technical_details_on", "data"),
+            State("status_flash", "data"),
+            State("model_snapshot", "data"),
+            prevent_initial_call=False,
+        )
+        def poll_model(
+            tick_n: int,
+            key_action: Any,
+            _clear_clicks: int,
+            technical_details_data: Any,
+            status_flash_data: Any,
+            model_snapshot_data: Any,
+        ):
+            status_cache = self._status_cache
+            technical_details_enabled = bool(technical_details_data)
+            trigger = ctx.triggered_id
+            decision = decide_poll_action(
+                trigger=trigger,
+                key_action=key_action,
+                has_polled=model_snapshot_data is not None,
+            )
+
+            # Refresh the view immediately when Technical details has changed since
+            # it was last built, rather than waiting for the next poll. Trigger
+            # identity isn't a reliable signal for this, so compare values instead.
+            view_is_stale = (
+                self._last_built_technical_details is not None
+                and self._last_built_technical_details != technical_details_enabled
+            )
+            if view_is_stale and decision.action not in (
+                ACTION_CLEAR_CACHE,
+                ACTION_NORMAL_POLL,
+                ACTION_REBUILD_VIEW,
+            ):
+                decision = PollDecision(action=ACTION_REBUILD_VIEW)
+
+            if decision.action == ACTION_CLEAR_CACHE:
+                with self._state_lock:
+                    snap, sc_store, view, flash, insights_data = self._handle_clear_cache(
+                        status_cache, technical_details_enabled
+                    )
+                self._last_built_technical_details = technical_details_enabled
+                return snap, sc_store, view, flash, insights_data
+
+            if decision.action == ACTION_NORMAL_POLL:
+                with self._state_lock:
+                    rendered = self._render_latest_poll(technical_details_enabled)
+                if rendered is None:
+                    return no_update, no_update, no_update, no_update, no_update
+                snap, sc_store, view, insights_data = rendered
+                self._last_built_technical_details = technical_details_enabled
+
+                now = datetime.now().timestamp()
+                if isinstance(status_flash_data, dict):
+                    until = status_flash_data.get("until")
+                    if isinstance(until, (int, float)) and now < until:
+                        return snap, sc_store, view, no_update, insights_data
+
+                return snap, sc_store, view, None, insights_data
+
+            if decision.action == ACTION_REBUILD_VIEW:
+                with self._state_lock:
+                    view = self.view_builder.build_view_from_cache(
+                        self.connection_state.cache, technical_details_enabled
+                    )
+                self._last_built_technical_details = technical_details_enabled
+                return no_update, no_update, view, no_update, no_update
+
+            return no_update, no_update, no_update, no_update, no_update
+
+    def _register_menu_callbacks(self) -> None:
+        @self.app.callback(
+            Output("menu_open", "data"),
+            Output("insights_on", "data"),
+            Output("technical_details_on", "data"),
+            Input("btn_menu", "n_clicks"),
+            Input("menu_overlay", "n_clicks"),
+            Input("key_action", "data"),
+            Input("menu_insights", "n_clicks"),
+            Input("menu_technical_details", "n_clicks"),
+            Input("menu_daily_report", "n_clicks"),
+            Input("menu_significant_connections", "n_clicks"),
+            Input("menu_open_ports", "n_clicks"),
+            Input("menu_unmapped", "n_clicks"),
+            Input("menu_lan_local", "n_clicks"),
+            Input("menu_export_cache", "n_clicks"),
+            Input("menu_geodb_management", "n_clicks"),
+            Input("menu_about", "n_clicks"),
+            Input("menu_help", "n_clicks"),
+            Input("menu_clear_cache", "n_clicks"),
+            Input("menu_autostart", "n_clicks", allow_optional=True),
+            Input("menu_exit", "n_clicks"),
+            State("menu_open", "data"),
+            State("insights_on", "data"),
+            State("technical_details_on", "data"),
+            prevent_initial_call=True,
+        )
+        def menu_controller(
+            _btn: int,
+            _overlay: int,
+            key_action: Any,
+            _insights: int,
+            _technical_details: int,
+            _daily_report: int,
+            _significant_connections: int,
+            _open_ports: int,
+            _unmapped: int,
+            _lan_local: int,
+            _export_cache: int,
+            _geodb_management: int,
+            _info: int,
+            _help: int,
+            _clear: int,
+            _autostart: int | None,
+            _exit: int,
+            menu_open: Any,
+            insights_on: Any,
+            technical_details_on: Any,
+        ) -> Any:
+            trigger = ctx.triggered_id
+
+            if trigger == "menu_insights" or (
+                trigger == "key_action"
+                and isinstance(key_action, dict)
+                and key_action.get("action") == "menu_insights"
+            ):
+                new_value = not bool(insights_on)
+                self.settings = replace(self.settings, insights_panel=new_value)
+                self._save_settings()
+                return no_update, new_value, no_update
+
+            if trigger == "menu_technical_details" or (
+                trigger == "key_action"
+                and isinstance(key_action, dict)
+                and key_action.get("action") == "menu_technical_details"
+            ):
+                new_value = not bool(technical_details_on)
+                self.settings = replace(self.settings, technical_details=new_value)
+                self._save_settings()
+                return no_update, no_update, new_value
+
+            next_state = compute_menu_open_state(
+                trigger=trigger,
+                menu_open=menu_open,
+                key_action=key_action,
+                menu_screens=self.MENU_SCREENS,
+                menu_commands=self.MENU_COMMANDS,
+            )
+
+            if next_state is None:
+                return no_update, no_update, no_update
+            return next_state, no_update, no_update
+
+        @self.app.callback(
+            Output("menu_panel", "className"),
+            Output("menu_overlay", "className"),
+            Input("menu_open", "data"),
+        )
+        def show_hide_menu(is_open: Any) -> tuple[str, str]:
+            open_flag = bool(is_open)
+            return self._menu_panel_class(open_flag), self._menu_overlay_class(open_flag)
+
+        @self.app.callback(
+            Output("insights_panel", "className"),
+            Input("insights_on", "data"),
+        )
+        def toggle_insights_panel(is_on: Any) -> str:
+            if bool(is_on):
+                return "insights-panel is-open"
+            return "insights-panel"
+
+        @self.app.callback(
+            Output("menu_insights", "className"),
+            Input("insights_on", "data"),
+        )
+        def toggle_insights_check(is_on: Any) -> str:
+            if bool(is_on):
+                return "mx-btn mx-btn--menu mx-btn--toggle is-checked"
+            return "mx-btn mx-btn--menu mx-btn--toggle"
+
+        @self.app.callback(
+            Output("menu_technical_details", "className"),
+            Input("technical_details_on", "data"),
+        )
+        def toggle_technical_details_check(is_on: Any) -> str:
+            if bool(is_on):
+                return "mx-btn mx-btn--menu mx-btn--toggle is-checked"
+            return "mx-btn mx-btn--menu mx-btn--toggle"
+
+        @self.app.callback(
+            Output("map", "style"),
+            Input("insights_on", "data"),
+        )
+        def resize_map(is_on: Any) -> dict[str, str]:
+            if bool(is_on):
+                return {"width": "calc(100% - 270px)"}
+            return {"width": "100%"}
+
+    def _register_geodb_callbacks(self) -> None:
+        @self.app.callback(
+            Output("geodb_event", "data"),
+            Input("btn_install_dbip", "n_clicks", allow_optional=True),
+            Input("btn_install_maxmind", "n_clicks", allow_optional=True),
+            Input("btn_update_databases", "n_clicks", allow_optional=True),
+            Input("btn_check_databases", "n_clicks", allow_optional=True),
+            State("input_maxmind_account_id", "value", allow_optional=True),
+            State("input_maxmind_license_key", "value", allow_optional=True),
+            running=[
+                (Output("btn_install_dbip", "disabled"), True, False),
+                (Output("btn_install_maxmind", "disabled"), True, False),
+                (Output("btn_update_databases", "disabled"), True, False),
+                (Output("btn_check_databases", "disabled"), True, False),
+],
+            prevent_initial_call=True,
+        )
+        def geodb_controller(
+            install_dbip_clicks: int | None,
+            install_maxmind_clicks: int | None,
+            update_clicks: int | None,
+            check_clicks: int | None,
+            account_id: str | None,
+            license_key: str | None,
+        ) -> GeoDbEvent:
+            trigger = ctx.triggered_id
+
+            if trigger == "btn_install_dbip":
+                if not install_dbip_clicks:
+                    raise PreventUpdate
+
+                response = self._handle_geo_install_dbip()
+                return {"action": "install_dbip", "response": response}
+
+            if trigger == "btn_install_maxmind":
+                if not install_maxmind_clicks:
+                    raise PreventUpdate
+
+                response = self._handle_geo_install_maxmind(account_id, license_key)
+                return {"action": "install_maxmind", "response": response}
+
+            if trigger == "btn_update_databases":
+                if not update_clicks:
+                    raise PreventUpdate
+
+                response = self._handle_geo_update()
+                return {"action": "update", "response": response}
+
+            if trigger == "btn_check_databases":
+                if not check_clicks:
+                    raise PreventUpdate
+
+                response = self._handle_geo_recheck()
+                return {"action": "recheck", "response": response}
+    
+            raise PreventUpdate
+        
+    def _register_os_callbacks(self) -> None:
+        @self.app.callback(
+            Input("btn_open_data", "n_clicks", allow_optional=True),
+            prevent_initial_call=True,
+        )
+        def open_data_folder(n_clicks: int | None) -> None:
+            if not n_clicks:
+                raise PreventUpdate
+
+            if self.runtime.is_docker or os.environ.get("TAPMAP_ANDROID") == "1":
+                # Android opens the Storage Access Framework picker from MainActivity.
+                return
+
+            ok, message = open_folder(self.runtime.geo_data_dir)
+
+            if not ok:
+                self.logger.warning(message)
+
+        @self.app.callback(
+            Input({"type": "reveal-exe", "path": ALL, "idx": ALL}, "n_clicks"),
+            prevent_initial_call=True,
+        )
+        def reveal_executable(_clicks: list[int | None]) -> None:
+            trigger_id = ctx.triggered_id
+            if not isinstance(trigger_id, dict):
+                raise PreventUpdate
+
+            path = trigger_id.get("path")
+            if not isinstance(path, str) or not path:
+                raise PreventUpdate
+
+            if self.runtime.is_docker:
+                return
+
+            ok, message = reveal_in_file_manager(Path(path))
+
+            if not ok:
+                self.logger.warning(message)
+
+        @self.app.callback(
+            Output("cache_download", "data"),
+            Input("menu_export_cache", "n_clicks"),
+            Input("key_action", "data"),
+            prevent_initial_call=True,
+        )
+        def export_cache(
+            n_clicks: int | None,
+            key_action: Any,
+        ) -> Any:
+            trigger = ctx.triggered_id
+            if trigger == "key_action":
+                if not (
+                    isinstance(key_action, dict) and key_action.get("action") == "menu_export_cache"
+                ):
+                    raise PreventUpdate
+            elif not n_clicks:
+                raise PreventUpdate
+            now = datetime.now()
+            filename = f"tapmap-cache-{now.strftime('%Y-%m-%d_%H-%M-%S')}.txt"
+            header = f"TapMap Cache Export\nGenerated: {now.strftime('%Y-%m-%d %H:%M:%S')}"
+            with self._state_lock:
+                text = self._status_cache.format_ui_cache_text(
+                    self.connection_state.cache, header=header
+                )
+            return dcc.send_string(text, filename)
+
+        @self.app.callback(
+            Input("key_action", "data"),
+            prevent_initial_call=True,
+        )
+        def exit_app(key_action: Any) -> None:
+            if not (isinstance(key_action, dict) and key_action.get("action") == "exit_confirmed"):
+                raise PreventUpdate
+            self.lifecycle.request_shutdown()
+
+    def _autostart_supported(self) -> bool:
+        """Return whether autostart is supported."""
+        return (os.environ.get("TAPMAP_ANDROID") != "1" and platform.system() in {"Windows", "Darwin", "Linux"} and not self.runtime.is_docker)
+
+    def _run_autostart_startup_setup(self) -> None:
+        """Set up autostart on first launch when needed."""
+        if not self._autostart_supported():
+            return
+
+        system = platform.system()
+        try:
+            if system == "Darwin":
+                from .autostart import macos_autostart
+
+                macos_autostart.run_startup_setup(
+                    app_data_dir=self.runtime.app_data_dir,
+                    is_frozen=self.runtime.is_frozen,
+                )
+            elif system == "Windows":
+                from .autostart import windows_autostart
+
+                windows_autostart.run_startup_setup(
+                    app_data_dir=self.runtime.app_data_dir,
+                    exe_path=self._autostart_exe_path(),
+                    is_frozen=self.runtime.is_frozen,
+                )
+            elif system == "Linux":
+                from .autostart import linux_autostart
+
+                linux_autostart.run_startup_setup(
+                    app_data_dir=self.runtime.app_data_dir,
+                    exe_path=self._autostart_exe_path(),
+                    is_frozen=self.runtime.is_frozen,
+                )
+        except Exception:
+            self.logger.exception("Autostart initial setup failed unexpectedly.")
+
+    def _autostart_exe_path(self) -> str:
+        """Return the installed TapMap executable path."""
+        if not self.runtime.is_frozen:
+            return ""
+        return str(Path(sys.executable).resolve())
+
+    def _current_autostart_decision(self):
+        """Return the current autostart display decision."""
+        from tapmap.state.autostart import AutostartDecision, ClickAction, DisplayState
+
+        system = platform.system()
+
+        if system == "Darwin":
+            from tapmap.autostart.macos_autostart import query_display_state
+
+            return query_display_state(is_frozen=self.runtime.is_frozen)
+
+        if system == "Windows":
+            from tapmap.autostart.windows_autostart import query_display_state
+
+            return query_display_state(
+                exe_path=self._autostart_exe_path(), is_frozen=self.runtime.is_frozen
+            )
+
+        if system == "Linux":
+            from tapmap.autostart.linux_autostart import query_display_state
+
+            return query_display_state(is_frozen=self.runtime.is_frozen)
+
+        return AutostartDecision(DisplayState.UNAVAILABLE, ClickAction.NONE)
+
+    @staticmethod
+    def _autostart_class_name(display_state: Any) -> str:
+        """Return the CSS class for an autostart display state."""
+        from tapmap.state.autostart import DisplayState
+
+        base = "mx-btn mx-btn--menu mx-btn--toggle"
+        if display_state == DisplayState.ON:
+            return base + " is-checked"
+        if display_state == DisplayState.UNAVAILABLE:
+            return base + " is-unavailable"
+        return base
+
+    @staticmethod
+    def _autostart_disabled(decision: Any) -> bool:
+        """Return whether the autostart control should be HTML-disabled for decision."""
+        from tapmap.state.autostart import ClickAction
+
+        return decision.click_action == ClickAction.NONE
+
+    def _handle_autostart_click(self) -> None:
+        """Perform the write a click on the R control implies. A disabled control is a no-op."""
+        system = platform.system()
+        if system == "Darwin":
+            self._handle_macos_autostart_click()
+        elif system == "Windows":
+            self._handle_windows_autostart_click()
+        elif system == "Linux":
+            self._handle_linux_autostart_click()
+
+    def _handle_windows_autostart_click(self) -> None:
+        """Handle the Windows autostart action."""
+        from tapmap.autostart import windows_autostart
+        from tapmap.state.autostart import ClickAction, WriteOutcome
+
+        decision = self._current_autostart_decision()
+        exe_path = self._autostart_exe_path()
+
+        if decision.click_action == ClickAction.DISABLE:
+            outcome, error = windows_autostart.disable(exe_path=exe_path)
+        elif decision.click_action == ClickAction.ENABLE:
+            outcome, error = windows_autostart.enable(exe_path=exe_path)
+        elif decision.click_action == ClickAction.CREATE:
+            outcome, error = windows_autostart.create(exe_path=exe_path)
+        elif decision.click_action == ClickAction.REPAIR_AND_ENABLE:
+            outcome, error = windows_autostart.repair_and_enable(exe_path=exe_path)
+        else:
+            return
+
+        if outcome == WriteOutcome.ERROR:
+            self.logger.warning("Autostart write failed: %s", error)
+
+    def _handle_macos_autostart_click(self) -> None:
+        """Handle the macOS autostart action."""
+        from tapmap.autostart import macos_autostart
+        from tapmap.state.autostart import ClickAction, WriteOutcome
+
+        decision = self._current_autostart_decision()
+
+        if decision.click_action == ClickAction.DISABLE:
+            outcome, error = macos_autostart.disable()
+        elif decision.click_action == ClickAction.CREATE:
+            outcome, error = macos_autostart.create()
+        elif decision.click_action == ClickAction.RECOVER_AND_ENABLE:
+            outcome, error = macos_autostart.recover_and_enable()
+        elif decision.click_action == ClickAction.OPEN_SETTINGS:
+            macos_autostart.open_settings()
+            return
+        else:
+            return
+
+        if outcome == WriteOutcome.ERROR:
+            self.logger.warning("Autostart write failed: %s", error)
+
+    def _handle_linux_autostart_click(self) -> None:
+        """Handle the Linux autostart action."""
+        from tapmap.autostart import linux_autostart
+        from tapmap.state.autostart import ClickAction, WriteOutcome
+
+        decision = self._current_autostart_decision()
+
+        if decision.click_action == ClickAction.DISABLE:
+            outcome, error = linux_autostart.disable()
+        elif decision.click_action == ClickAction.ENABLE:
+            outcome, error = linux_autostart.enable()
+        elif decision.click_action == ClickAction.CREATE:
+            outcome, error = linux_autostart.create(exe_path=self._autostart_exe_path())
+        else:
+            return
+
+        if outcome == WriteOutcome.ERROR:
+            self.logger.warning("Autostart write failed: %s", error)
+
+    @staticmethod
+    def _autostart_trigger_kind(
+        *, trigger: Any, menu_open: Any, n_clicks: Any, key_action: Any
+    ) -> str:
+        """Classify an autostart trigger as act, refresh, or ignore."""
+        if trigger == "menu_open":
+            return "refresh" if menu_open else "ignore"
+
+        if trigger == "menu_autostart":
+            return "act" if n_clicks else "ignore"
+
+        if trigger == "key_action":
+            if (
+                menu_open
+                and isinstance(key_action, dict)
+                and key_action.get("action") == "menu_autostart"
+            ):
+                return "act"
+            return "ignore"
+
+        return "ignore"
+
+    @staticmethod
+    def _notifications_trigger_kind(
+        *, trigger: Any, menu_open: Any, n_clicks: Any, key_action: Any
+    ) -> str:
+        """Classify a notifications toggle trigger as actionable or ignored."""
+        if trigger == "menu_notifications":
+            return "act" if n_clicks else "ignore"
+
+        if trigger == "key_action":
+            if (
+                menu_open
+                and isinstance(key_action, dict)
+                and key_action.get("action") == "menu_notifications"
+            ):
+                return "act"
+            return "ignore"
+
+        return "ignore"
+
+    def _register_notifications_callbacks(self) -> None:
+        @self.app.callback(
+            Output("menu_notifications", "className"),
+            Output("notifications_on", "data"),
+            Input("menu_notifications", "n_clicks"),
+            Input("key_action", "data"),
+            State("menu_open", "data"),
+            State("notifications_on", "data"),
+            prevent_initial_call=True,
+        )
+        def notifications_controller(
+            n_clicks: int | None,
+            key_action: Any,
+            menu_open: Any,
+            notifications_on: Any,
+        ) -> tuple[str, bool]:
+            kind = self._notifications_trigger_kind(
+                trigger=ctx.triggered_id,
+                menu_open=menu_open,
+                n_clicks=n_clicks,
+                key_action=key_action,
+            )
+
+            if kind == "ignore":
+                raise PreventUpdate
+
+            new_value = not bool(notifications_on)
+            self.settings = replace(self.settings, desktop_notifications=new_value)
+            self._save_settings()
+            if self.desktop_notification_channel is not None:
+                self.desktop_notification_channel.enabled = new_value
+
+            class_name = "mx-btn mx-btn--menu mx-btn--toggle"
+            if new_value:
+                class_name += " is-checked"
+            return class_name, new_value
+
+    def _register_autostart_callbacks(self) -> None:
+        @self.app.callback(
+            Output("menu_autostart", "className"),
+            Output("menu_autostart", "disabled"),
+            Input("menu_open", "data"),
+            Input("menu_autostart", "n_clicks"),
+            Input("key_action", "data"),
+            prevent_initial_call=True,
+        )
+        def autostart_controller(
+            menu_open: Any, n_clicks: int | None, key_action: Any
+        ) -> tuple[Any, Any]:
+            kind = self._autostart_trigger_kind(
+                trigger=ctx.triggered_id,
+                menu_open=menu_open,
+                n_clicks=n_clicks,
+                key_action=key_action,
+            )
+
+            if kind == "ignore":
+                raise PreventUpdate
+
+            if kind == "act":
+                self._handle_autostart_click()
+
+            decision = self._current_autostart_decision()
+            return self._autostart_class_name(decision.display_state), self._autostart_disabled(
+                decision
+            )
+
+    def _register_modal_render_callbacks(self) -> None:
+        @self.app.callback(
+            Output("modal_overlay", "className"),
+            Output("modal_body", "children"),
+            Output("modal_body", "className"),
+            Output("modal_content_request", "data"),
+            Input("modal_state", "data"),
+            State("geodb_event", "data"),
+            prevent_initial_call=False,
+        )
+        def modal_shell(
+            modal_state_data: Any,
+            geodb_event_data: Any,
+        ):
+            """Open or close the modal and show its loading state."""
+            is_open = isinstance(modal_state_data, dict)
+            overlay_class = self._modal_overlay_class(is_open)
+
+            if not is_open:
+                return overlay_class, [], "modal-body", no_update
+
+            screen = modal_state_data.get("screen")
+            if screen == "menu_exit":
+                body_class = "modal-body no-close"
+            else:
+                body_class = (
+                    self._class_for_modal_screen(screen)
+                    if isinstance(screen, str)
+                    else "modal-body"
+                )
+
+            placeholder = html.Div(
+                html.Div(className="mx-spinner"),
+                className="mx-modal-loading",
+            )
+
+            content_request = {
+                "modal_state": modal_state_data,
+                "geodb_event": geodb_event_data,
+            }
+
+            return overlay_class, [placeholder], body_class, content_request
+
+        @self.app.callback(
+            # Replace the loading placeholder with the rendered content.
+            Output("modal_body", "children", allow_duplicate=True),
+            Input("modal_content_request", "data"),
+            State("ui_view", "data"),
+            State("model_snapshot", "data"),
+            State("technical_details_on", "data"),
+            State("notifications_on", "data"),
+            prevent_initial_call=True,
+        )
+        def modal_content_renderer(
+            content_request: Any,
+            ui_view: Any,
+            snapshot: Any,
+            technical_details_data: Any,
+            notifications_data: Any,
+        ):
+            """Render the current modal screen's real content into modal_body."""
+            if not isinstance(content_request, dict):
+                raise PreventUpdate
+
+            modal_state_data = content_request.get("modal_state")
+            geodb_event_data = content_request.get("geodb_event")
+            geo_path = str(self.runtime.geo_data_dir)
+
+            with self._state_lock:
+                children, _body_class = self._render_modal(
+                    modal_state_data,
+                    snapshot,
+                    ui_view,
+                    geo_path,
+                    geodb_event_data,
+                    bool(technical_details_data),
+                    bool(notifications_data),
+                )
+
+            return children
+
+        @self.app.callback(
+            # GeoDB operations manage their own loading state.
+            Output("modal_body", "children", allow_duplicate=True),
+            Input("geodb_event", "data"),
+            State("modal_state", "data"),
+            prevent_initial_call=True,
+        )
+        def geodb_status_renderer(
+            geodb_event_data: Any,
+            modal_state_data: Any,
+        ) -> list[Any]:
+            """Refresh the open GeoDB management screen after an operation."""
+            children = self._render_geodb_status(geodb_event_data, modal_state_data)
+
+            if children is None:
+                raise PreventUpdate
+
+            return children
+
+    def _register_modal_callbacks(self) -> None:
+        @self.app.callback(
+            Output("modal_state", "data"),
+            Input("menu_open_ports", "n_clicks"),
+            Input("menu_unmapped", "n_clicks"),
+            Input("menu_lan_local", "n_clicks"),
+            Input("menu_geodb_management", "n_clicks"),
+            Input("menu_about", "n_clicks"),
+            Input("menu_help", "n_clicks"),
+            Input("menu_daily_report", "n_clicks"),
+            Input("menu_significant_connections", "n_clicks"),
+            Input("menu_exit", "n_clicks"),
+            Input("btn_close", "n_clicks"),
+            Input("toggle_open_ports_system", "value", allow_optional=True),
+            Input("map", "clickData"),
+            Input("btn_view_log", "n_clicks", allow_optional=True),
+            Input("btn_log_back", "n_clicks", allow_optional=True),
+            Input(
+                {
+                    "type": "sc_row",
+                    "timestamp": ALL,
+                    "pid": ALL,
+                    "ip": ALL,
+                    "port": ALL,
+                    "proto": ALL,
+                },
+                "n_clicks",
+            ),
+            Input("btn_sc_back", "n_clicks", allow_optional=True),
+            Input(
+                {
+                    "type": "insights-entry",
+                    "category": ALL,
+                    "value": ALL,
+                },
+                "n_clicks",
+            ),
+            Input("key_action", "data"),
+            State("modal_state", "data"),
+            State("open_ports_prefs", "data"),
+            State("selected_country", "data"),
+            prevent_initial_call=True,
+        )
+        def modal_controller(
+            _open_ports_clicks: int,
+            _unmapped_clicks: int,
+            _lan_local_clicks: int,
+            _geodb_management_clicks: int,
+            _about_clicks: int,
+            _help_clicks: int,
+            _daily_report_clicks: int,
+            _significant_connections_clicks: int,
+            _exit_clicks: int,
+            _close_clicks: int,
+            toggle_system_value: Any,
+            click_data: Any,
+            _view_log_clicks: int | None,
+            _log_back_clicks: int | None,
+            _sc_row_clicks: list[int],
+            _sc_back_clicks: int | None,
+            _insights_entry_clicks: list[int],
+            key_action: Any,
+            modal_state_data: Any,
+            open_ports_prefs_data: Any,
+            selected_country: Any,
+        ):
+            current_state = modal_state_data if isinstance(modal_state_data, dict) else None
+            current_screen = (
+                current_state.get("screen") if isinstance(current_state, dict) else None
+            )
+            trigger = ctx.triggered_id
+       
+            if trigger == "btn_close":
+                return None
+
+            is_open = current_state is not None
+            action = None
+
+            if trigger == "key_action" and isinstance(key_action, dict):
+                action = key_action.get("action")
+
+            now_iso = datetime.now().isoformat()
+            open_ports_prefs = (
+                open_ports_prefs_data if isinstance(open_ports_prefs_data, dict) else None
+            )
+            route = decide_modal_route(
+                trigger=trigger,
+                trigger_value=ctx.triggered[0]["value"] if ctx.triggered else None,
+                selected_country=selected_country,
+                is_open=is_open,
+                current_screen=current_screen if isinstance(current_screen, str) else None,
+                action=action,
+                show_system=self._toggle_on(toggle_system_value),
+                menu_screens=self.MENU_SCREENS,
+                open_ports_prefs=open_ports_prefs,
+                click_data=click_data,
+                now_iso=now_iso,
+            )
+
+            if route.action == "apply":
+                return route.modal_state
+              
+            return no_update
+
+        @self.app.callback(
+            Output("open_ports_prefs", "data"),
+            Input("toggle_open_ports_system", "value", allow_optional=True),
+            State("open_ports_prefs", "data"),
+            prevent_initial_call=True,
+        )
+        def open_ports_toggle(toggle_value: Any, prefs_data: Any) -> dict[str, Any]:
+            return set_show_system_pref(toggle_value=toggle_value, prefs_data=prefs_data)
+
+    def _register_map_callbacks(self) -> None:
+        @self.app.callback(
+            Output("map", "figure"),
+            Input("ui_view", "data"),
+            Input("selected_country", "data"),
+            Input("camera_mode", "data"),
+        )
+        def render_map(ui_view: Any, selected_country: Any, camera_mode: Any) -> Any:
+            view = self._ensure_dict(ui_view)
+            fit_connections = (camera_mode == "connections")
+
+            if "points" not in view:
+                return no_update
+
+            points = self._ensure_list(view.get("points"))
+            summaries = self._ensure_dict(view.get("summaries"))
+
+            if not points:
+                return self.ui.create_figure(
+                    ([], self.my_location),
+                    summaries=summaries,
+                    selected_country=selected_country,
+                    fit_connections=fit_connections,
+                )
+
+            return self.ui.create_figure(
+                (points, self.my_location),
+                summaries=summaries,
+                selected_country=selected_country,
+                fit_connections=fit_connections,
+            )
+
+        @self.app.callback(
+            Output("selected_country", "data"),
+            Output("camera_mode", "data"),
+            Input("key_action", "data"),
+            Input(
+                {
+                    "type": "insights-entry",
+                    "category": ALL,
+                    "value": ALL,
+                },
+                "n_clicks",
+            ),
+            State("selected_country", "data"),
+            State("camera_mode", "data"),
+            prevent_initial_call=True,
+        )
+        def update_map_state(
+            key_action: Any,
+            _clicks_country: list[int],
+            current_country: Any,
+            current_camera_mode: Any,
+        ) -> tuple[Any, Any]:
+
+            trigger_id = ctx.triggered_id
+
+            # Keyboard
+            if trigger_id == "key_action":
+                if (
+                    isinstance(key_action, dict)
+                    and key_action.get("action") == ACTION_ZOOM_CONNECTIONS
+                ):
+                    if current_camera_mode == "connections":
+                        return None, None
+
+                    return None, "connections"
+
+                return no_update, no_update
+
+            # Country selection
+            current = current_country if isinstance(current_country, str) else None
+
+            if not ctx.triggered:
+                return no_update, no_update
+
+            trigger = ctx.triggered[0]
+            if not trigger["value"]:
+                return no_update, no_update
+
+            if not isinstance(trigger_id, dict) or trigger_id.get("category") != "countries":
+                return no_update, no_update
+
+            country_code = trigger_id.get("value")
+            if not isinstance(country_code, str):
+                return no_update, no_update
+
+            if current == country_code:
+                return None, None
+
+            return country_code, None
+
+        @self.app.callback(
+            Output("selected_country", "data", allow_duplicate=True),
+            Output("map", "relayoutData"),
+            Input("map", "relayoutData"),
+            prevent_initial_call=True,
+        )
+        def clear_country_on_map_reset(relayout_data: Any) -> tuple[Any, Any]:
+            """Clear the selected country when the map's Reset button is used."""
+            if not self._is_map_reset(relayout_data):
+                return no_update, no_update
+
+            # Dash ignores unchanged props; clearing relayoutData lets the next
+            # identical Reset event trigger this callback again.
+            return None, None
+
+    def _register_status_callbacks(self) -> None:
+        @self.app.callback(
+            Output("status_bar", "children"),
+            Input("model_snapshot", "data"),
+            Input("status_cache", "data"),
+            Input("status_flash", "data"),
+        )
+        def render_status(
+            snapshot: Any,
+            status_cache_data: Any,
+            status_flash: Any,
+        ) -> str:
+            return render_status_text(
+                snapshot=snapshot,
+                status_cache_data=status_cache_data,
+                status_flash=status_flash,
+                myloc_label=self._myloc_label(),
+                to_int=self._to_int,
+            )
+
+    def _register_insights_callbacks(self) -> None:
+        @self.app.callback(
+            Output("insights_panel", "children"),
+            Input("insights_cache", "data"),
+            Input("selected_country", "data"),
+        )
+        def update_insights(
+            data: dict[str, Any] | None,
+            selected_country: Any,
+        ) -> list[Any]:
+
+            if not isinstance(data, dict):
+                return []
+
+            return render_insights_panel(data, selected_country=selected_country)
+
+    def _activate_desktop_notification_channel(self) -> None:
+        """Activate the desktop notification channel when available."""
+        if self.desktop_notification_channel is not None:
+            self.desktop_notification_channel.activate()
+
+    def _create_tray_icon(self) -> TrayIcon | None:
+        """Build the desktop tray icon when supported."""
+
+        if (
+            self.runtime.is_docker
+            or os.environ.get("TAPMAP_ANDROID") == "1"
+        ):
+            return None
+
+        return create_tray_icon(
+            icon_path=self.runtime.tray_icon_path,
+            tooltip=self.runtime.meta.name,
+            on_open=lambda: self._open_browser_immediately(
+                self._server_url()
+            ),
+            on_quit=self.lifecycle.request_shutdown,
+        )
+
+    def _macos_browser_decision_is_deferred(self) -> bool:
+        """Return whether macOS login-launch detection is required."""
+        return (
+            platform.system() == "Darwin"
+            and self.runtime.is_frozen
+            and not self.runtime.is_docker
+            and self.runtime.launch_browser
+        )
+
+    def _macos_browser_decision(self, url: str, is_login_launch: bool) -> None:
+        """Open the browser unless macOS launched TapMap as a login item."""
+        if is_login_launch:
+            self.logger.info("Suppressing automatic browser launch: login-item launch detected.")
+            return
+        self._open_browser(url)
+
+    def _decide_browser_open(self, url: str, icon: TrayIcon | None) -> None:
+        """Open or defer the browser according to the launch context.
+
+        Do not open the browser if macOS login-launch detection is unavailable.
+        """
+        if self._macos_browser_decision_is_deferred():
+            if icon is None:
+                self.logger.warning(
+                    "Tray unavailable; cannot detect macOS login-launch status. "
+                    "Not opening the browser automatically."
+                )
+                return
+            try:
+                from .autostart import macos_login_launch
+
+                macos_login_launch.install(
+                    lambda is_login_launch: self._macos_browser_decision(url, is_login_launch)
+                )
+            except Exception:
+                self.logger.exception(
+                    "Unable to install macOS login-launch detection. "
+                    "Not opening the browser automatically."
+                )
+            return
+
+        if self.runtime.launch_browser and not self.runtime.is_docker:
+            self._open_browser(url)
+
+    def run(self) -> None:
+        """Start the local TapMap server and polling thread."""
+
+        host = self.runtime.server_host
+        port = self.runtime.server_port
+        url = self._server_url()
+
+        android = os.environ.get("TAPMAP_ANDROID") == "1"
+
+        icon = self._create_tray_icon()
+
+        if not android:
+            self._decide_browser_open(url, icon)
+
+        self.logger.info(
+            "Starting %s %s on %s",
+            self.runtime.meta.name,
+            self.runtime.meta.version,
+            url,
+            extra={"section_break": True},
+        )
+
+        server = make_server(host, port, self.app.server)
+
+        self._poller_thread = start_poller_thread(
+            self.poll_once,
+            POLL_INTERVAL_MS / 1000,
+            self.lifecycle,
+        )
+
+        if icon is not None:
+            self.lifecycle.set_tray_icon(icon)
+
+        if not android:
+            self.lifecycle.install_signal_handlers()
+
+        server_thread = start_server_thread(
+            server,
+            self.lifecycle,
+        )
+
+        if android:
+            self._android_server = server
+            self._android_server_thread = server_thread
+            self.logger.info("TapMap Android server is running at %s", url)
+            return
+
+        if icon is not None:
+            self.lifecycle.run_tray(
+                icon,
+                on_ready=self._activate_desktop_notification_channel,
+            )
+        else:
+            self._activate_desktop_notification_channel()
+            self.lifecycle.wait_for_shutdown()
+
+        server.shutdown()
+        server_thread.join()
+
+    @staticmethod
+    def _empty_insights() -> dict[str, Any]:
+        return {"countries": {}, "providers": {}, "ports": {}, "applications": {}}
+
+    def _load_history(self) -> None:
+        """Load Insights and Significant Connections history from disk (delegated).
+
+        Start a history empty if its file cannot be loaded. Move a corrupt file to a
+        timestamped backup; disable saving a file that cannot be read or backed up.
+        """
+        try:
+            self.insights_state = load_insights(self.insights_path)
+            self._is_insights_save_enabled = True
+        except (ValueError, OSError) as exc:
+            self._is_insights_save_enabled = self._preserve_unloadable_history(
+                self.insights_path, exc
+            )
+            self.insights_state = InsightsState(
+                version=CURRENT_SCHEMA_VERSION,
+                insights=self._empty_insights(),
+                verification_failed={},
+            )
+
+        try:
+            significant_connections_items = load_significant_connections(
+                self.significant_connections_path
+            )
+            self._is_significant_connections_save_enabled = True
+        except (ValueError, OSError) as exc:
+            self._is_significant_connections_save_enabled = self._preserve_unloadable_history(
+                self.significant_connections_path, exc
+            )
+            significant_connections_items = []
+        self.significant_connections = SignificantConnections(significant_connections_items)
+
+    def _preserve_unloadable_history(self, path: Path, reason: ValueError | OSError) -> bool:
+        """Back up a corrupt history file and log why it was not loaded.
+
+        Return True if saving path is safe: the corrupt original was moved to a backup.
+        Return False if the original remains in place, unreadable or not backed up.
+        """
+        if isinstance(reason, OSError):
+            self.logger.error(
+                "Unable to read history file %s (%s). Started with empty history; "
+                "it will not be saved this session.",
+                path.name,
+                reason,
+            )
+            return False
+
+        try:
+            backup_path = backup_corrupt_file(path, datetime.now())
+        except OSError as exc:
+            self.logger.error(
+                "Corrupt history file %s (%s) could not be backed up (%s). "
+                "Started with empty history; it will not be saved this session.",
+                path.name,
+                reason,
+                exc,
+            )
+            return False
+
+        self.logger.error(
+            "Corrupt history file %s (%s). Moved it to %s and started with empty history.",
+            path.name,
+            reason,
+            backup_path.name,
+        )
+        return True
+
+    def _record_learning_completion_from_history(self) -> None:
+        """Record learning completion if loaded Insights and event days reach the threshold.
+
+        Count the days of the Insights history together with the days of the
+        Significant Connection events. Log when completion is recorded.
+        """
+        if record_learning_completion(
+            self.insights_state,
+            self.runtime.notification_learning_days,
+            datetime.now().date().toordinal(),
+            event_day_ordinals(self.significant_connections.items),
+        ):
+            self.logger.info(
+                "Notification learning period completed based on existing history; "
+                "notifications are enabled."
+            )
+
+    def _maybe_save_history(self) -> None:
+        """Save Insights and Significant Connections history periodically to limit disk writes.
+
+        Save on the first call, then at most every 60 s of monotonic time.
+        Prune stale significance last-seen entries before each periodic save.
+        """
+        now_s = time.monotonic()
+        with self._state_lock:
+            if self._last_history_save_s is not None and now_s - self._last_history_save_s < 60:
+                return
+            self._last_history_save_s = now_s
+            self.significance_history.prune(datetime.now().date().toordinal())
+        self._save_history()
+
+    def _save_settings(self) -> None:
+        """Write settings data to disk atomically."""
+        try:
+            save_settings(self.settings_path, self.settings)
+        except Exception as exc:
+            self.logger.warning(
+                "Unable to save settings. Changes will not be preserved. Reason: %s",
+                exc,
+            )
+
+    def _save_history(self, lock_timeout_s: float | None = None) -> None:
+        """Write Insights and Significant Connections history to disk atomically (delegated).
+
+        Serialize saves under _history_save_lock: copy the history under
+        _state_lock and write the copy after releasing it. Each file's save
+        failure is isolated so one failing write does not prevent the other
+        from being persisted. Skip a file whose saving was disabled by
+        _load_history. If lock_timeout_s is given, wait at most that long for
+        each lock; on timeout, log an error and skip the save.
+        """
+        timeout_s = -1 if lock_timeout_s is None else lock_timeout_s
+        if not self._history_save_lock.acquire(timeout=timeout_s):
+            self.logger.error("History save skipped: history is locked by another thread.")
+            return
+        try:
+            if not self._state_lock.acquire(timeout=timeout_s):
+                self.logger.error("History save skipped: history is locked by another thread.")
+                return
+            try:
+                insights_state = copy.deepcopy(self.insights_state)
+                significant_connection_items = copy.deepcopy(self.significant_connections.items)
+            finally:
+                self._state_lock.release()
+            self._write_history(insights_state, significant_connection_items)
+        finally:
+            self._history_save_lock.release()
+
+    def _write_history(
+        self, insights_state: InsightsState, significant_connection_items: list[dict[str, Any]]
+    ) -> None:
+        """Write the given history copies to their files, logging each failed write.
+
+        Caller holds _history_save_lock.
+        """
+        if self._is_insights_save_enabled:
+            try:
+                save_insights(self.insights_path, insights_state)
+            except Exception as exc:
+                self.logger.warning(
+                    "Unable to save insights. Changes will not be preserved. Reason: %s",
+                    exc,
+                )
+
+        if self._is_significant_connections_save_enabled:
+            try:
+                save_significant_connections(
+                    self.significant_connections_path, significant_connection_items
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Unable to save Significant Connections history. Changes will not be"
+                    " preserved. Reason: %s",
+                    exc,
+                )
+
+    def _acquire_lock(self) -> None:
+        """Acquire the application data lock."""
+
+        if os.environ.get("TAPMAP_ANDROID") == "1":
+            self._lock_path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            self._lock_path.write_text(
+                json.dumps({"pid": os.getpid(), "android": True}),
+                encoding="utf-8",
+            )
+            return
+
+        import psutil
+
+        if self._lock_path.exists():
+            try:
+                lock = json.loads(
+                    self._lock_path.read_text(encoding="utf-8")
+                )
+
+                if (
+                    isinstance(lock, dict)
+                    and "pid" in lock
+                    and "create_time" in lock
+                ):
+                    running_process = psutil.Process(
+                        int(lock["pid"])
+                    )
+
+                    if running_process.create_time() == float(
+                        lock["create_time"]
+                    ):
+                        self.logger.warning(
+                            "Another TapMap instance is already running."
+                        )
+
+                        if not self.runtime.is_docker:
+                            self._open_browser_immediately(
+                                self._server_url()
+                            )
+
+                        sys.exit(1)
+
+            except (
+                OSError,
+                json.JSONDecodeError,
+                psutil.NoSuchProcess,
+            ):
+                pass
+
+        current_process = psutil.Process()
+
+        self._lock_path.write_text(
+            json.dumps(
+                {
+                    "pid": current_process.pid,
+                    "create_time": current_process.create_time(),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _release_lock(self) -> None:
+        """Remove the PID lock file."""
+        with contextlib.suppress(OSError):
+            self._lock_path.unlink(missing_ok=True)
+
+    def close(self) -> None:
+        """Stop the poller, save history a final time, release the lock file, close resources.
+
+        Request shutdown and wait up to POLLER_JOIN_TIMEOUT_S for the poller.
+        If the poller is still running, wait at most SHUTDOWN_LOCK_TIMEOUT_S
+        per lock for the final save, and keep the lock file and Model
+        resources until process exit; the next start replaces the stale lock file.
+        """
+        self.logger.info("Shutting down")
+        self.lifecycle.request_shutdown()
+
+        android_server = getattr(self, "_android_server", None)
+        android_thread = getattr(self, "_android_server_thread", None)
+
+        if android_server is not None:
+            try:
+                android_server.shutdown()
+                android_server.server_close()
+            except Exception:
+                self.logger.exception("Android server shutdown failed.")
+
+        if android_thread is not None:
+            android_thread.join(timeout=5)
+
+        if self._stop_poller():
+            self._save_history()
+            self._release_lock()
+            with self._model_lock:
+                netinfo_close_fn = getattr(self.model.netinfo, "close", None)
+                if callable(netinfo_close_fn):
+                    netinfo_close_fn()
+                close_fn = getattr(self.model.geoinfo, "close", None)
+                if callable(close_fn):
+                    close_fn()
+                appinfo_close_fn = getattr(self.model.appinfo, "close", None)
+                if callable(appinfo_close_fn):
+                    appinfo_close_fn()
+        else:
+            self._save_history(lock_timeout_s=SHUTDOWN_LOCK_TIMEOUT_S)
+
+        if self.mqtt_channel is not None:
+            self.mqtt_channel.close()
+
+    def _stop_poller(self) -> bool:
+        """Wait up to POLLER_JOIN_TIMEOUT_S for the poller thread to exit.
+
+        Caller has requested shutdown. Return True if no poller is running
+        afterwards; log an error otherwise.
+        """
+        if self._poller_thread is None:
+            return True
+        self._poller_thread.join(timeout=POLLER_JOIN_TIMEOUT_S)
+        if self._poller_thread.is_alive():
+            self.logger.error(
+                "Background poller did not stop within %.0f s; keeping the lock file"
+                " and Model resources until exit.",
+                POLLER_JOIN_TIMEOUT_S,
+            )
+            return False
+        return True
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Build command-line parser."""
+    parser = argparse.ArgumentParser(
+        prog="tapmap",
+        description="Start TapMap.",
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version=f"%(prog)s {APP_META.version}",
+        help="Show installed version and exit.",
+    )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Do not open the web browser automatically at startup.",
+    )
+    parser.add_argument(
+        "--configure-mqtt",
+        action="store_true",
+        help="Interactively configure, update, or remove MQTT notifications, then exit.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run application from the command line."""
+    args = _build_arg_parser().parse_args(argv)
+    runtime_ctx = build_runtime(APP_META, no_browser=args.no_browser)
+
+    if args.configure_mqtt:
+        return run_configure_mqtt(runtime_ctx)
+
+    configure_logging(runtime_ctx)
+    app = TapMap(runtime_ctx)
+    try:
+        app.run()
+    finally:
+        app.close()
+        logging.shutdown()
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
