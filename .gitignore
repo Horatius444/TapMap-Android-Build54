@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Build output (PyInstaller)
+build/
+dist/
+tools/windows/file_version_info.txt
+
+# IDE / OS
+.vscode/*
+!.vscode/launch.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# MkDocs build
+site/
+
+# Private notes
+.private/
+
+# Output from exploratory tests
+out/
+
+# Docker runtime data
+docker-data/
+
+# GeoIP databases (must not be committed)
+*.mmdb

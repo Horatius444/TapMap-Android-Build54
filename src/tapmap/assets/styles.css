@@ -1,0 +1,1016 @@
+/* Ensure width includes padding and border for all elements */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+/* Country flags; Chrome and Edge on Windows have no flag glyphs.
+   unicode-range keeps all other text, including the globe fallback, on the next fonts. */
+@font-face {
+  font-family: "Twemoji Country Flags";
+  src: url("TwemojiCountryFlags.woff2") format("woff2");
+  unicode-range: U+1F1E6-1F1FF;
+  /* Without swap, text using this font list can stay hidden until the font loads. */
+  font-display: swap;
+}
+
+:root {
+  --mx-green: #00ff66;
+  --mx-green-soft: rgba(0, 255, 102, 0.55);
+  --mx-green-faint: rgba(0, 255, 102, 0.18);
+
+  --mx-border: rgba(0, 170, 68, 0.95);
+  --mx-border-strong: rgba(0, 255, 102, 0.95);
+
+  --mx-bg: #020602;
+  --mx-bg-hover: #041004;
+  --mx-bg-2: #010401;
+
+  --mx-overlay: rgba(0, 0, 0, 0.62);
+
+  --mx-shadow: 0 10px 36px rgba(0, 0, 0, 0.65);
+  --mx-shadow-soft: 0 0 12px rgba(0, 255, 102, 0.14);
+
+  --mx-glow-hover: 0 0 8px rgba(0, 255, 102, 0.22);
+  --mx-glow-strong: 0 0 12px rgba(0, 255, 102, 0.32);
+
+  --mx-radius: 10px;
+  --mx-radius-lg: 12px;
+
+  --mx-font: "Twemoji Country Flags", ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", "Courier New", monospace;
+
+  --mx-modal-max-h: 80vh;
+  --mx-modal-w: min(900px, 68vw);
+
+  --mx-pad-x: 14px;
+  --mx-pad-y: 12px;
+
+  --mx-sticky-title-h: 56px;
+}
+
+/* Base */
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  background: #000;
+}
+
+.app {
+  height: 100vh;
+  position: relative;
+  overflow: hidden;
+  background: #000;
+  font-family: var(--mx-font);
+}
+
+.map {
+  height: 100vh;
+  width: 100%;
+  position: relative;
+  z-index: 0;
+}
+
+.app-header {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+
+  display: flex;
+  align-items: center;
+  gap: 10px;
+
+  z-index: 10;
+}
+.app-logo {
+  width: 16px;
+  height: 16px;
+
+  pointer-events: none;
+}
+
+.app-title {
+  color: var(--mx-green);
+  font-size: 17px;
+  font-weight: 650;
+  user-select: none;
+  pointer-events: none;
+  text-shadow: 0 0 10px rgba(0, 255, 102, 0.18);
+}
+
+/* key_capture input: hide the Dash-generated container entirely.
+   keys.js uses the native value setter + a dispatched input event,
+   so the element does not need to be visible or focusable. */
+.app > .dash-input-container.dash-input {
+  display: none !important;
+}
+
+/* Buttons */
+
+.mx-btn {
+  appearance: none;
+  user-select: none;
+  -webkit-appearance: none;
+  background: var(--mx-bg);
+  color: var(--mx-green);
+  border: 1px solid var(--mx-border);
+  border-radius: var(--mx-radius);
+  cursor: pointer;
+  font-family: var(--mx-font);
+  padding: 8px 12px;
+  font-size: 13px;
+  line-height: 1;
+  transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease, transform 80ms ease,
+    color 120ms ease;
+}
+
+.mx-btn:hover {
+  background: var(--mx-bg-hover);
+  border-color: var(--mx-border-strong);
+  box-shadow: var(--mx-shadow-soft), var(--mx-glow-hover);
+}
+
+.mx-btn:active {
+  transform: translateY(1px);
+}
+
+.mx-btn:focus-visible {
+  outline: none;
+  border-color: var(--mx-border-strong);
+  box-shadow: var(--mx-shadow-soft), var(--mx-glow-strong);
+}
+
+.mx-btn--icon {
+  padding: 8px 10px;
+  font-size: 16px;
+  line-height: 16px;
+}
+
+.mx-btn--menu {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 10px;
+  margin: 0 0 8px 0;
+  font-size: 13px;
+}
+
+.mx-btn--toggle::before {
+  content: "\2610";
+  display: inline-block;
+  width: 1.2em;
+}
+
+.mx-btn--toggle.is-checked::before {
+  content: "\2611";
+}
+
+.mx-btn--toggle.is-unavailable::before {
+  content: "\2612";
+}
+
+.mx-btn--primary {
+  padding: 10px 16px;
+  font-size: 14px;
+  border-color: var(--mx-border-strong);
+  box-shadow: var(--mx-shadow-soft);
+}
+
+.mx-btn--nowrap {
+  white-space: nowrap;
+}
+
+.mx-btn:disabled {
+    opacity: 0.7;
+    cursor: not-allowed;
+    border-color: rgba(0, 170, 68, 0.8);
+    color: rgba(0, 255, 102, 0.8);
+    box-shadow: none;
+}
+
+.mx-btn:disabled:hover {
+    background: var(--mx-bg);
+    border-color: rgba(0, 170, 68, 0.8);
+    box-shadow: none;
+}
+
+a.mx-btn {
+  display: inline-block;
+  text-decoration: none;
+}
+
+/* Menu */
+.mx-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 19;
+  background: transparent;
+
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 80ms linear;
+}
+
+.mx-overlay.is-open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.mx-panel {
+  position: absolute;
+  top: 48px;
+  left: 10px;
+  z-index: 20;
+  min-width: 200px;
+  padding: 10px;
+  background: linear-gradient(180deg, rgba(2, 10, 2, 0.92), rgba(2, 6, 2, 0.92));
+  border: 1px solid var(--mx-border);
+  border-radius: var(--mx-radius-lg);
+  box-shadow: var(--mx-shadow);
+
+  opacity: 0;
+  transform: translateY(-4px);
+  transform-origin: top;
+  pointer-events: none;
+  transition: opacity 80ms linear, transform 80ms linear;
+  will-change: opacity, transform;
+}
+
+.mx-panel.is-open {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.mx-acc-section {
+  list-style: none;
+}
+
+.mx-acc-section + .mx-acc-section {
+  margin-top: 2px;
+}
+
+summary.mx-acc-header {
+  list-style: none;
+  cursor: pointer;
+  padding: 6px 10px;
+  color: var(--mx-green);
+  font-family: var(--mx-font);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  opacity: 0.6;
+  user-select: none;
+  border-radius: var(--mx-radius);
+  transition: opacity 80ms linear, background-color 80ms linear;
+}
+
+summary.mx-acc-header::-webkit-details-marker {
+  display: none;
+}
+
+summary.mx-acc-header::marker {
+  display: none;
+  content: "";
+}
+
+summary.mx-acc-header::before {
+  content: "\25B6  ";
+  font-size: 8px;
+  vertical-align: middle;
+}
+
+details[open] > summary.mx-acc-header::before {
+  content: "\25BC  ";
+}
+
+summary.mx-acc-header:hover {
+  opacity: 1;
+  background: var(--mx-bg-hover);
+}
+
+.mx-acc-body {
+  padding: 2px 0 4px 0;
+}
+
+/* Insights panel */
+.insights-panel {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 270px;
+  padding: 12px;
+  color: var(--mx-green);
+  background: rgba(10, 20, 10, 0.85);
+  border-left: 1px solid var(--mx-green-faint);
+  z-index: 5;
+  overflow-y: auto;
+  /* animation */
+  opacity: 0;
+  transform: translateX(8px);
+  pointer-events: none;
+  transition: opacity 80ms linear, transform 80ms linear;
+}
+
+.insights-panel.is-open {
+  opacity: 1;
+  transform: translateX(0);
+  pointer-events: auto;
+}
+
+.insights-title {
+  font-size: 18px;
+  font-weight: 600;
+  opacity: 0.95;
+  margin: 10px 0 14px 0;
+}
+
+.insights-subtitle {
+  font-size: 14px;
+  font-weight: 500;
+  opacity: 0.85;
+  margin: 6px 0 4px 0;
+}
+
+.insights-subtitle.dimmed {
+  opacity: 0.55;
+}
+
+.insights-list {
+  margin-bottom: 12px;
+}
+
+/* Row */
+.insights-row {
+  display: block;
+  padding: 4px 0;
+  cursor: default;
+}
+
+.insights-row.clickable {
+  cursor: pointer;
+}
+
+.mx-exe-link {
+  cursor: pointer;
+  text-decoration: underline dotted;
+}
+
+.insights-row-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.insights-row:hover {
+  opacity: 1;
+}
+
+.insights-row.clickable:hover {
+  opacity: 0.8;
+}
+
+.insights-row.selected {
+  border-left: 4px solid var(--mx-green);
+  padding-left: 6px;
+  color: white;
+  font-weight: 700;
+}
+
+/* Cells */
+.insights-flag {
+  flex: 0 0 21px;
+  font-size: 17px;
+  text-align: center;
+}
+
+.insights-flag:empty {
+  display: none;
+}
+
+.insights-country {
+  font-size: 13px;
+  flex: 1 0 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Modal */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: var(--mx-overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 80ms linear;
+}
+
+.modal-overlay.is-open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.modal-card {
+  width: 100%;
+  max-width: var(--mx-modal-w);
+  max-height: var(--mx-modal-max-h);
+  overflow: hidden;
+  padding: 0;
+  background: linear-gradient(180deg, rgba(2, 10, 2, 0.95), rgba(2, 6, 2, 0.95));
+  border: 1px solid var(--mx-border);
+  border-radius: var(--mx-radius-lg);
+  box-shadow: var(--mx-shadow);
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  opacity: 0;
+  transform: translateY(-6px);
+  transition: opacity 80ms linear, transform 80ms linear;
+  min-height: 0;
+}
+
+.modal-overlay.is-open .modal-card {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.modal-body {
+  overflow: auto;
+  min-height: 0;
+  padding: 10px var(--mx-pad-x);
+  box-sizing: border-box;
+  color: var(--mx-green);
+  font-size: 13px;
+  line-height: 1.45;
+  scrollbar-color: var(--mx-border) var(--mx-bg);
+  scrollbar-width: thin;
+  scrollbar-gutter: stable;
+}
+
+.modal-body h1 {
+  margin: 0 0 8px 0;
+  text-shadow: 0 0 10px rgba(0, 255, 102, 0.12);
+}
+
+.modal-body h2 {
+  margin: 16px 0 8px 0;
+  opacity: 0.95;
+}
+
+.modal-subtitle {
+  margin: 6px 0 12px 0;
+  font-size: 12px;
+  line-height: 1.35;
+  opacity: 0.82;
+}
+
+.modal-body p {
+  margin: 0 0 10px 0;
+  opacity: 0.92;
+}
+
+.modal-body ul,
+.modal-body ol {
+  margin: 0 0 10px 18px;
+  padding: 0;
+}
+
+.modal-body li {
+  margin: 0 0 6px 0;
+}
+
+.modal-body pre {
+  margin: 0;
+  white-space: pre-wrap;
+  /* pre does not inherit font-family; keep the browser's monospace for other characters. */
+  font-family: "Twemoji Country Flags", monospace;
+}
+
+.mx-modal-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 6px var(--mx-pad-x);
+  border-top: 1px solid rgba(0, 170, 68, 0.8);
+  background: var(--mx-bg);
+}
+
+.modal-body.no-close ~ .mx-modal-actions {
+  display: none;
+}
+
+.modal-body.mx-sticky-title {
+  padding-top: 0;
+  --mx-sticky-top: var(--mx-sticky-title-h);
+}
+
+.modal-body.mx-sticky-title h1:first-child {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: linear-gradient(180deg, rgba(2, 10, 2, 0.98), rgba(2, 6, 2, 0.98));
+  margin: 0 0 8px 0;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(0, 170, 68, 0.8);
+}
+
+/* GeoDB provider cards */
+
+.mx-geodb-choices {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin: 12px 0 20px 0;
+}
+
+.mx-geodb-choices--single {
+  grid-template-columns: 1fr;
+  max-width: 460px;
+}
+
+.mx-geodb-choices--single .mx-geodb-card {
+  width: 100%;
+}
+
+.mx-geodb-card {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px 16px 14px 16px;
+  border: 1px solid var(--mx-border);
+  border-radius: var(--mx-radius);
+  background: var(--mx-bg-2);
+}
+
+.mx-geodb-card__header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 0;
+}
+
+.mx-geodb-card__header h2 {
+  margin: 0;
+  font-size: 1rem;
+  text-shadow: 0 0 10px rgba(0, 255, 102, 0.12);
+}
+
+.mx-pill {
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  text-transform: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--mx-green);
+  opacity: 0.95;
+  text-shadow: 0 0 10px rgba(0, 255, 102, 0.12);
+  transform: translateY(-1px);
+  white-space: nowrap;
+}
+
+.mx-pill--spacer {
+  visibility: hidden;
+}
+
+.mx-form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 4px 0;
+}
+
+.mx-input {
+  background: var(--mx-bg);
+  border: 1px solid var(--mx-border);
+  border-radius: var(--mx-radius);
+  color: var(--mx-green);
+  font-family: var(--mx-font);
+  font-size: 13px;
+  padding: 5px 8px;
+  width: 100%;
+  outline: none;
+}
+
+.mx-input--narrow {
+  max-width: 200px;
+}
+
+.mx-input:focus {
+  border-color: var(--mx-border-strong);
+  box-shadow: var(--mx-glow-hover);
+}
+
+.mx-link {
+  color: var(--mx-green);
+  font-size: 0.85rem;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  line-height: 1.4;
+}
+
+.mx-link:hover {
+  color: #fff;
+}
+
+.mx-status {
+  margin-top: 8px;
+  padding-top: 8px;
+  min-height: 1.25rem;
+  border-top: 1px solid rgba(0, 170, 68, 0.3);
+  font-size: 0.8rem;
+  color: rgba(0, 255, 102, 0.65);
+}
+
+.mx-status__value {
+  color: var(--mx-green);
+  min-height: 1.4em;
+  margin-top: 12px;
+}
+
+.mx-manual-install {
+  margin-top: 4px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(0, 170, 68, 0.45);
+}
+
+.mx-manual-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.mx-manual-install p {
+  margin: 0 0 6px 0;
+}
+
+.mx-manual-install ol {
+  margin: 0 0 10px 0;
+  padding-left: 1.4em;
+  color: rgba(0, 255, 102, 0.8);
+  font-size: 0.9rem;
+  line-height: 1.7;
+}
+
+.mx-manual-btn {
+  min-width:215px;
+  text-align: center;
+}
+
+.mx-section-title {
+  margin: 0 0 6px 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--mx-green);
+}
+
+.geodb-running::before {
+    content: "";
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    margin-right: 8px;
+    border: 2px solid currentColor;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: geodb-spin 0.8s linear infinite;
+    vertical-align: middle;
+}
+
+@keyframes geodb-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.mx-form-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px 12px;
+  align-items: center;
+  margin: 6px 0;
+}
+
+.mx-form-grid label {
+  margin: 0;
+  white-space: nowrap;
+}
+
+.modal-body ul.mx-feature-list {
+  list-style: none;
+  margin: 1px 0 2px 0;
+  padding: 0;
+}
+
+.mx-feature-list li {
+  margin: 0;
+  line-height: 1.3;
+}
+
+.mx-geodb-right-column {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.mx-geodb-status-card {
+  flex: 1;
+}
+
+#geodb-status-text {
+  flex: 1;
+  display: flex;
+  align-items: center;
+}
+
+/* Path row */
+
+.mx-path-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  margin: 10px 0 16px 0;
+  max-width: 100%;
+}
+
+.mx-path-box {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--mx-green);
+  font-family: var(--mx-font);
+  font-size: 13px;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow-x: auto;
+  max-width: 560px;
+}
+
+/* Scrollbar */
+
+.modal-body::-webkit-scrollbar {
+  width: 10px;
+}
+
+.modal-body::-webkit-scrollbar-track {
+  background: var(--mx-bg-2);
+}
+
+.modal-body::-webkit-scrollbar-thumb {
+  background: rgba(0, 170, 68, 0.8);
+  border: 2px solid var(--mx-bg-2);
+  border-radius: 10px;
+}
+
+.modal-body::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 255, 102, 0.75);
+}
+
+/* Header controls */
+
+.mx-h1-with-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.mx-title-toggle {
+  font-size: 0.9rem;
+  line-height: 1;
+}
+
+.mx-title-toggle label,
+.mx-title-toggle label span,
+.mx-title-toggle label * {
+  color: var(--mx-green) !important;
+}
+
+.mx-title-toggle label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.mx-title-toggle label:hover {
+  opacity: 0.85;
+}
+
+.mx-title-toggle input {
+  accent-color: var(--mx-green);
+}
+
+/* Links */
+
+.modal-body a,
+.modal-body a:visited {
+  color: rgba(0, 255, 102, 0.92);
+  text-decoration: underline;
+  text-decoration-color: rgba(0, 255, 102, 0.55);
+  text-underline-offset: 2px;
+}
+
+.modal-body a:hover,
+.modal-body a:active {
+  color: #66ff99;
+  text-decoration-color: rgba(0, 255, 102, 0.95);
+}
+
+/* Tables */
+
+.mx-table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+  margin: 0 0 12px 0;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.mx-table th,
+.mx-table td {
+  border: 1px solid rgba(0, 170, 68, 0.8);
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mx-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: rgba(2, 6, 2, 0.98);
+  font-size: larger;
+  border-color: rgba(0, 255, 102, 0.35);
+  box-shadow: 0 1px 0 rgba(0, 255, 102, 0.12);
+}
+.modal-body.mx-sticky-title .mx-table thead th {
+  top: var(--mx-sticky-top);
+}
+.mx-table.mx-kv td {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+.mx-table.mx-kv td:first-child {
+  width: 90px;
+  white-space: nowrap;
+}
+.mx-table.mx-kv td:nth-child(2) {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.mx-table.mx-significant-connections tbody tr {
+  cursor: pointer;
+}
+
+.mx-table.mx-significant-connections tbody tr:hover {
+  opacity: 0.8;
+}
+
+/* Modal loading placeholder */
+
+.mx-modal-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 0;
+}
+
+.mx-spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid rgba(0, 255, 102, 0.25);
+  border-top-color: var(--mx-green);
+  border-radius: 50%;
+  animation: mx-spin 0.7s linear infinite;
+}
+
+@keyframes mx-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Status bar */
+
+.status-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 40;
+  padding: 6px 10px;
+  background: rgba(2, 6, 2, 0.92);
+  border-top: 1px solid rgba(0, 170, 68, 0.85);
+  color: rgba(0, 255, 102, 0.92);
+  font-size: 12px;
+  line-height: 1;
+  letter-spacing: 0.2px;
+  opacity: 0.96;
+  user-select: none;
+}
+
+/* Insights Log viewer */
+
+.insights-log-body {
+  max-width: 760px;
+  margin: 0 auto;
+}
+
+.insights-log-body > h1 {
+  margin-top: 18px;
+}
+
+.insights-log-pre-wrapper {
+  width: fit-content;
+  max-width: 100%;
+  margin: 0 auto;
+  overflow-x: auto;
+}
+
+.insights-log-pre-wrapper .insights-log-pre {
+  white-space: pre;
+}
+
+/* Daily Activity Report */
+
+.rpt-h2 {
+  margin-top: 32px;
+}
+
+.rpt-recurrence {
+  margin-top: 16px;
+  margin-left: 140px;
+}
+
+.rpt-cat-label {
+  display: inline-block;
+  min-width: 140px;
+  color: #00e85c;
+  font-weight: bold;
+  font-size: 11px;
+}
+
+.rpt-day-strip {
+  letter-spacing: 1px;
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+.rpt-day--on {
+  color: rgba(0, 220, 88, 0.80);
+  text-shadow: none;
+  -webkit-text-stroke: 0px;
+}
+
+.rpt-day--off {
+  color: rgba(0, 185, 72, 0.70);
+  text-shadow: none;
+  -webkit-text-stroke: 0.6px rgba(0, 185, 72, 0.90);
+}
+
+/* Reduced motion */
+
+@media (prefers-reduced-motion: reduce) {
+  .mx-panel {
+    transition: none;
+    transform: none;
+  }
+
+  .mx-overlay {
+    transition: none;
+  }
+
+  .modal-overlay {
+    transition: none;
+  }
+
+  .insights-panel {
+    transition: none;
+    transform: none;
+  }
+}
