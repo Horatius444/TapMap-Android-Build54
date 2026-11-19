@@ -1,0 +1,50 @@
+[project]
+name = "tapmap"
+version = "1.14.4"
+description = "Watch your computer connect across the internet in real time. Discover the world behind your apps."
+requires-python = ">=3.13"
+authors = [
+    { name = "Ola Lie", email = "ola@tip.no" }
+]
+
+[project.scripts]
+tapmap = "tapmap.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+tapmap = ["assets/*"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF", "D"]
+ignore = [
+  "D100", "D104", "D107",
+  "D203", "D213",
+  "D401",
+]
+per-file-ignores = { "tests/*" = ["D101", "D102", "D103"] }
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tools"]
+
+[tool.pyright]
+# Keep Pylance's default level; a config file otherwise defaults to "standard".
+typeCheckingMode = "off"
+extraPaths = ["src"]
+# tools/ is a script directory; only tests import its modules directly.
+executionEnvironments = [
+  { root = "tests", extraPaths = ["src", "tools"] },
+]
