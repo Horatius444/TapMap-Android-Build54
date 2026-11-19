@@ -1,0 +1,267 @@
+from __future__ import annotations
+
+import os
+import platform
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+from .app_dirs import ensure_app_data_dir, ensure_native_app_data_dir
+from .config import (
+    CACHE_RETENTION_MIN,
+    LAUNCH_BROWSER,
+    NOTIFICATION_LEARNING_DAYS,
+    SERVER_PORT,
+)
+
+
+@dataclass(frozen=True)
+class AppMeta:
+    """Define application metadata."""
+
+    name: str
+    version: str
+    author: str
+
+
+@dataclass(frozen=True)
+class RuntimeContext:
+    """Define runtime context for the current OS and execution mode.
+
+    Attributes:
+        meta: Application metadata.
+        app_data_dir: Per-user application data directory.
+        run_dir: Directory containing the executable or source entry point.
+        is_frozen: True when running as a bundled executable (PyInstaller).
+        net_backend: Network connection backend name.
+        net_backend_version: Network backend version.
+        security_extensions_dir: Directory containing the Microsoft Security
+            Extensions wrapper DLLs (Windows only; may not exist on other OSes).
+        tray_icon_path: Path to the tray icon image asset.
+        notification_learning_days: Active Insights days required before notifications begin.
+    """
+
+    meta: AppMeta
+    app_data_dir: Path
+    run_dir: Path
+    is_frozen: bool
+    net_backend: str
+    net_backend_version: str
+    server_host: str
+    server_port: int
+    launch_browser: bool
+    cache_retention_min: int
+    is_docker: bool
+    location_override: tuple[float, float] | None
+    security_extensions_dir: Path
+    tray_icon_path: Path
+    notification_learning_days: int
+
+    @property
+    def geo_data_dir(self) -> Path:
+        """Return the directory containing GeoIP databases."""
+        return self.app_data_dir
+
+def _get_app_data_dir(meta: AppMeta) -> Path:
+    """Return application data directory for the current runtime."""
+    data_dir = os.environ.get("TAPMAP_DATA_DIR")
+    if data_dir:
+        app_dir = Path(data_dir)
+        ensure_app_data_dir(app_dir)
+        return app_dir
+
+    return ensure_native_app_data_dir(meta.name)
+
+def _get_security_extensions_dir(is_frozen: bool, run_dir: Path) -> Path:
+    """Return the directory containing the Microsoft Security Extensions DLLs.
+
+    Frozen: resolved relative to the PyInstaller bundle directory.
+    Source run: resolved relative to the repository root, two levels above
+    run_dir (src/tapmap/).
+    """
+    if is_frozen:
+        bundle_dir = Path(sys._MEIPASS)
+        return bundle_dir / "third_party" / "microsoft_security_extensions"
+
+    return run_dir.parent.parent / "third_party" / "microsoft_security_extensions"
+
+def _get_tray_icon_path(is_frozen: bool, run_dir: Path) -> Path:
+    """Return the path to the tray icon image asset.
+
+    Frozen: resolved relative to the PyInstaller bundle directory.
+    Source run: resolved relative to run_dir (src/tapmap/).
+    """
+    if is_frozen:
+        bundle_dir = Path(sys._MEIPASS)
+        return bundle_dir / "tapmap" / "assets" / "tapmap.ico"
+
+    return run_dir / "assets" / "tapmap.ico"
+
+def _get_server_host(is_docker: bool) -> str:
+    """Return server bind host for the current runtime."""
+    host = os.environ.get("TAPMAP_HOST")
+    if host:
+        return host
+
+    if is_docker:
+        return "0.0.0.0"
+
+    return "127.0.0.1"
+
+def _get_server_port() -> int:
+    """Return server port for the current runtime."""
+    return int(os.environ.get("TAPMAP_PORT", str(SERVER_PORT)))
+
+def _get_launch_browser(no_browser: bool) -> bool:
+    """Return whether to launch the browser automatically."""
+    # Precedence: no_browser (--no-browser) overrides TAPMAP_LAUNCH_BROWSER
+    # overrides the config default.
+    if no_browser:
+        return False
+
+    value = os.environ.get("TAPMAP_LAUNCH_BROWSER")
+
+    if value is None:
+        return LAUNCH_BROWSER
+
+    value = value.strip().lower()
+
+    if value in {"1", "true", "yes", "on"}:
+        return True
+
+    if value in {"0", "false", "no", "off"}:
+        return False
+
+    return LAUNCH_BROWSER
+
+
+def _get_cache_retention_min() -> int:
+    """Return UI cache retention time in minutes."""
+    value = os.environ.get("TAPMAP_CACHE_RETENTION_MIN")
+
+    if value is None:
+        return CACHE_RETENTION_MIN
+
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return CACHE_RETENTION_MIN
+
+def _get_notification_learning_days() -> int:
+    """Return the configured notification learning period in active days."""
+    value = os.environ.get("TAPMAP_NOTIFICATION_LEARNING_DAYS")
+
+    if value is None:
+        return NOTIFICATION_LEARNING_DAYS
+
+    try:
+        parsed = int(value)
+    except ValueError:
+        return NOTIFICATION_LEARNING_DAYS
+
+    if 0 <= parsed <= 30:
+        return parsed
+
+    return NOTIFICATION_LEARNING_DAYS
+
+def _detect_docker() -> bool:
+    """Return True when running in Docker."""
+    return os.environ.get("TAPMAP_IN_DOCKER") == "1"
+
+
+def _get_location_override() -> tuple[float, float] | None:
+    """Parse TAPMAP_LON and TAPMAP_LAT env vars; return override or None.
+
+    Both vars must exist together. Both must parse as float.
+    lon must be -180 <= lon <= 180. lat must be -90 <= lat <= 90.
+    On any validation failure: return None (silent fallback to config.py).
+    """
+    lon_str = os.environ.get("TAPMAP_LON", "")
+    lat_str = os.environ.get("TAPMAP_LAT", "")
+
+    if not lon_str or not lat_str:
+        return None
+
+    try:
+        lon = float(lon_str)
+        lat = float(lat_str)
+    except ValueError:
+        return None
+
+    if -180 <= lon <= 180 and -90 <= lat <= 90:
+        return (lon, lat)
+
+    return None
+
+def build_runtime(meta: AppMeta, *, no_browser: bool = False) -> RuntimeContext:
+    """Build the runtime context for the current OS and execution mode."""
+    is_frozen = bool(getattr(sys, "frozen", False))
+    run_dir = (
+        Path(sys.executable).resolve().parent if is_frozen else Path(__file__).resolve().parent
+    )
+
+    app_data_dir = _get_app_data_dir(meta)
+    net_backend, net_backend_version = _detect_network_backend()
+    is_docker = _detect_docker()
+    server_host = _get_server_host(is_docker)
+    server_port = _get_server_port()
+    launch_browser = _get_launch_browser(no_browser)
+    cache_retention_min = _get_cache_retention_min()
+    location_override = _get_location_override()
+    security_extensions_dir = _get_security_extensions_dir(is_frozen, run_dir)
+    tray_icon_path = _get_tray_icon_path(is_frozen, run_dir)
+    notification_learning_days = _get_notification_learning_days()
+
+    return RuntimeContext(
+        meta=meta,
+        app_data_dir=app_data_dir,
+        run_dir=run_dir,
+        is_frozen=is_frozen,
+        net_backend=net_backend,
+        net_backend_version=net_backend_version,
+        server_host=server_host,
+        server_port=server_port,
+        launch_browser=launch_browser,
+        cache_retention_min=cache_retention_min,
+        is_docker=is_docker,
+        location_override=location_override,
+        security_extensions_dir=security_extensions_dir,
+        tray_icon_path=tray_icon_path,
+        notification_learning_days=notification_learning_days,
+    )
+
+def _detect_network_backend() -> tuple[str, str]:
+    """Return the network backend name and version."""
+
+    if os.environ.get("TAPMAP_ANDROID") == "1":
+        return "pcapdroid", "UDP exporter"
+
+    system = platform.system()
+
+    if system in {"Windows", "Linux"}:
+        import psutil
+        return "psutil", getattr(psutil, "__version__", "-")
+
+    if system == "Darwin":
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["lsof", "-v"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return "lsof", "-"
+
+        text = (result.stdout or "") + "\n" + (result.stderr or "")
+
+        for line in text.splitlines():
+            line_s = line.strip()
+            if line_s.lower().startswith("revision:"):
+                return "lsof", line_s.split(":", 1)[1].strip()
+
+        return "lsof", "-"
+
+    return "unknown", "unknown"
